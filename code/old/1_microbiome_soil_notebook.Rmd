@@ -1,0 +1,370 @@
+---
+title: "Text Analysis on Soil Microbiome"
+output: html_notebook
+---
+
+This purpose of this R notebook is to evaluate the performance on natural language based models on microbiome data to predict environmental traits of interest. We use a GloVe or Global Vectors for Word Representation algorithm to transform taxa-taxa cooccurence data from samples of interest into a taxa-property space. We then train a Random Forest model using this space to predict traits of interest. We compare our GloVe trained model to two other models using principal components and relative abundance. Principal Component Analysis is a common method for dimension reduction in bacterial datasets. The relative abundance trained model represents a baseline for model performance using untransformed/reduced data. 
+
+### Traits of interest
+Based on the metadata available, we predict the highest tier within the provided ontology of environmental biomes that consists of more than one unique term. In the EMP dataset, biome metadata for each sample is categorized in 5 levels; 
+
+  + **Domains** : envo_biome_0 > env_biome_1 > env_biome_2 > env_biome_3 > env_biome_4
+  
+  + **Example** : Biome (1) > terrestrial biome (1) > anthropogenic terrestrial biome (6) > cropland biome (10)
+
+The number in parenthesis represents the number of unique terms in that tier. For this analysis, we predict env_biome_2 which consists of 6 unique biome types; anthropogenic terrestrial, desert, forest, grassland, shrubland, tundra.
+
+For comparison, we also try to predict the principal investigator of each sample. Because we are training our models to aggregated data from multiple studies, we want to check if the properties we are picking up from our data come from environmental correlations and not the study itself. We want to avoid the case where our models only accurately predict sample environments because each sample environment is uniquely tied to a particular study. In an ideal case, our model would be able to discern samples that came from two different environments even if they both came from the same study by the same principal investigator. 
+
+## Environment Set up
+First we set up the necessary libraries, define folder paths, and load data.
+```{r, echo = FALSE, message = FALSE}
+#load packages
+list.of.packages <- c("textmineR", "tidyverse", "randomForest", "text2vec", "parallel", "pROC")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, library, character.only = TRUE)
+```
+```{r}
+#clear environment
+rm(list = ls())
+
+#folders
+dataFolder <- "../data/"
+OTU_filename <- "emp_cr_gg_13_8.subset_2k.biom"                    #2k subset of EMP data
+sample_filename <- "emp_qiime_mapping_subset_2k.tsv"
+
+#load the data
+OTU_file <- paste(dataFolder, OTU_filename, sep = "")
+sample_file <- paste(dataFolder, sample_filename, sep = "")
+
+biomf <- biomformat::read_biom(OTU_file)
+OTU_table <- biomformat::biom_data(biomf)
+rm(biomf)
+sample_data <- read_tsv(sample_file)
+
+#Preview data
+dim(OTU_table) #2000 samples with 66901 unique taxa
+dim(sample_data) #200 samples with 76 metadata columns
+head(sample_data[1:10,1:10])
+```
+
+## Reshape data
+Here we reshape the data by filtering samples that contain "soil" within their description. After filtering, we remove taxa that are not present in any of the soil samples. This reduces the dimensions of our interest data.
+```{r}
+int_data <- dplyr::filter(sample_data, grepl('soil', Description)) %>% #filter data into description
+  mutate(feature = envo_biome_2) #define feature of interest as envo_biome_2
+int_filter <- dplyr::pull(int_data, "#SampleID") #pull sample names with soil in description
+
+
+
+OTU_sub <- OTU_table[,int_filter] #subset to only soil samples
+OTU_sub <- OTU_sub[!Matrix::rowSums(OTU_sub) == 0 ,] #remove rows with no taxa
+dim(OTU_sub) #27472 unique taxa with 65 soil samples.
+head(OTU_sub[1:10,1:10])
+```
+
+## Model Features
+Next, we use GloVe and Principal Componenet Analysis to transform the taxa counts into the corresponding taxa-property transformation space. For the GloVe algorithm, we use the function "Dtm2Tcm", which converts a document taxa matrix into a term co-occurence matrix. In this case, each bacterial "sample", represents a document while each "taxa" represent a term. Bacterial counts per sample are equivalent to "terms" within a "document" in the natural language analysis framework. 
+```{r}
+##GloVe Algorithm
+#(slow) < 3 minutes, limited by RAM
+cooccur_table <- textmineR::Dtm2Tcm(t(OTU_sub)) #converts a document term matrix into a term co-occurence matrix. 
+#define hyperparameters for glove model
+glove = GlobalVectors$new(rank = 50, x_max = 10) 
+#fit main glove model word vectors
+#using an intel i5 and GTX1060 3GB this step took approximately 10 minutes
+wv_main = glove$fit_transform(cooccur_table, n_iter = 10, convergence_tol = 0.01, n_threads = 8)
+#pull out context word vectors
+wv_context = glove$components
+dim(wv_context)
+#combine main and context word vectors
+word_vectors = wv_main + t(wv_context)
+
+##PCR embeddings
+pcr_embeddings <- prcomp(t(OTU_sub),rank = 50)$rotation #50 prinicipal components
+
+#relative abundance
+rf_abundance <- apply(OTU_sub, MARGIN = 2, FUN = function(x){x/sum(x)}) %>%
+  as.matrix() %>%
+  t()
+
+head(word_vectors[1:10,1:10])
+#head(pcr_embeddings[1:10,1:10])
+#head(rf_abundance[1:10,1:10])
+```
+## Further Reshaping
+After creating our taxa-property space, we add a column representing the metadata feature we are trying to predict to each dataframe. This is for ease of use of the Random Forest functionm which takes in a dataframe and predicts the values within a column of interest based on the other columns within the dataframe. 
+```{r}
+#custom function to add appropriate metadata to each sample based on SampleID
+add_predict <- function(x, y, predict){
+  res <- crossprod(x = x, y = y) %>%
+    t() %>% 
+    as.data.frame() %>%
+    tibble::rownames_to_column(var = "#SampleID") %>%
+    left_join(predict, by = "#SampleID") %>%
+    select(-c("#SampleID")) %>%
+    mutate(feature = as.factor(feature))
+  return(res)
+}
+
+#subset data by taxa data of interest into train and test
+predict <- select(int_data, c("#SampleID", "feature"))
+rf_word <- add_predict(x = word_vectors, y = OTU_sub, predict = predict)
+rf_pca <- add_predict(x = pcr_embeddings, y = OTU_sub, predict = predict)
+head(rf_word[,(ncol(rf_word)-2):ncol(rf_word)])
+```
+## Train Models
+Before we run our models. We first subset each space into a training and test set.
+```{r}
+#Define training samples
+train_holdout <- 0.80
+n = nrow(rf_word) * train_holdout #n = the number of samples * our training holdout
+train <- base::sample(nrow(rf_pca),n) #randomly sample n bacteria-samples
+#Subset data
+rf_word_train <- rf_word[train,]
+rf_word_train <- mutate(rf_word_train, feature = factor(feature)) #after subsetting, we have to re-factorized the feature column to account for now missing factor levels. 
+rf_word_test <- rf_word[-c(train),]
+#
+rf_pca_train <- rf_pca[train,]
+rf_pca_train <- mutate(rf_pca_train, feature = factor(feature)) 
+rf_pca_test <- rf_pca[-c(train),]
+#
+rf_abundance_train <- rf_abundance[train,]
+rf_abundance_test <- rf_abundance[-c(train),]
+
+#train models
+word_model <- randomForest::randomForest(feature ~ ., data = rf_word_train)
+pca_model <- randomForest::randomForest(feature~., data = rf_pca_train)
+#(takes several minutes)
+abundance_model <- randomForest::randomForest(y = as.factor(predict$feature[train]), x = rf_abundance_train) 
+#check model performance on training data
+pred_word_train <- predict(word_model, rf_word_train, type = "class")
+pred_pca_train <- predict(pca_model, rf_pca_train, type = "class")
+pred_abundance_train <- predict(abundance_model, rf_abundance_train, type = "class")
+#Accuracy, or TP+FP/N
+mean(pred_word_train == rf_word_train$feature)
+mean(pred_pca_train == rf_pca_train$feature)
+mean(pred_abundance_train == (predict$feature[train]))
+```
+## Model Performance
+After training the models, we predict on the set aside test set. We evaluate model performance in multiple ways;
+ 
+ + Simple accuracy assessment: what percent of model predictions are accurate? This method is an easy way to  multiclass classifiers.
+ 
+ + Confusion Matrix: a specific table layout that allows visualization of the performance of an algorithm in terms of True Positive, True Negative, False Positive, and False Negative. We also calculate some derivations from the confusion matrix such as sensitivity, specificity, positive predictive value, and negative predictive value. We calculate confusion matrix statistics for each predicted environment class and as an average. 
+ 
+## accuracy
+```{r, echo = TRUE}
+#make predictions
+pred_word_test <- predict(word_model, rf_word_test, type = "class")
+pred_pca_test <- predict(pca_model, rf_pca_test, type = "class")
+pred_abundance_test <- predict(abundance_model, rf_abundance_test, type = "class")
+
+#accuracy
+a <- mean(pred_word_test == rf_word_test$feature)
+b <- mean(pred_pca_test == rf_pca_test$feature)
+c <- mean(pred_abundance_test == predict$feature[-c(train)])
+barplotdf <- data.frame(percent = c(a,b,c), name = c("word", "pca", "relative abundance"))
+ggplot(barplotdf, aes(x = reorder(name, -percent), y = percent)) + 
+  geom_bar(stat = "identity", aes(fill = name)) +
+  geom_text(aes(label=round(percent,3))) + labs(title = "principal investigator") +
+  xlab("") + ylab("accuracy")
+
+#create table of predicted vs observed
+res_word <- table(pred_word_test, rf_word_test$feature)
+res_pca <- table(pred_pca_test, rf_pca_test$feature)
+res_abundance <- table(pred_abundance_test, as.character(predict$feature[-c(train)]))
+
+#custom heatmap function to plot positive predictions
+custom_heatmap <- function(subdf, s_title = ""){
+  subdf <- subdf %>% #convert table to long format 
+    as.data.frame()
+  colnames(subdf) <- c("A", "B", "Freq") #rename columns
+  subdf <- subdf %>%
+    mutate(Freq = as.numeric(Freq)) %>% 
+    group_by(A) %>%
+    mutate(countT= sum(Freq, na.rm = T)) %>%
+    group_by(B, add=TRUE) %>%
+    mutate(per=round(100*Freq/countT,2)/100)
+  res <- ggplot(subdf, aes(x = A,y = B)) + geom_tile(aes(fill = per)) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    scale_fill_continuous(high = "black", low = "antiquewhite") +
+    xlab("Predict") + ylab("Observed") +
+    labs(title = s_title)
+  
+  return(res)
+}
+custom_heatmap(res_word, s_title = "word_PI")
+custom_heatmap(res_pca, s_title = "pca_PI")
+custom_heatmap(res_abundance, s_title = "relative_abundance_PI")
+```
+
+## Confusion Matrix
+```{r}
+##Sensitivity and Specificity
+custom_evaluate <- function(x){
+  res <- list()
+  temp <- x %>%
+    as.data.frame() %>%
+    mutate(Freq = as.numeric(Freq))
+  colnames(temp) <- c("predict", "observed", "Freq")
+  temp <- temp %>%
+    mutate(predict = as.character(predict), observed = as.character(observed))
+  categories <- unique(temp$predict)
+  for(i in 1:length(categories)){
+    subject = categories[i]
+    TP <- filter(temp, observed == subject & predict == subject) %>% 
+      summarize(n = sum(Freq))
+    FP <- filter(temp, observed != subject & predict == subject) %>% 
+      summarize(n = sum(Freq))
+    TN <- filter(temp, observed != subject & predict != subject) %>% 
+      summarize(n = sum(Freq))
+    FN <- filter(temp, observed == subject & predict != subject) %>% 
+      summarize(n = sum(Freq))
+    PPV <- TP/(TP+FP)
+    NPV <- TN/(FN+TN)
+    sensitivity <- TP/(TP+FN)
+    specificity <- TN/(FP+TN)
+    temp_res <- as.numeric(c(TP, FP, TN, FN, PPV, NPV, sensitivity, specificity))
+    names(temp_res) <- c("TP", "FP", "TN", "FN", "PPV", "NPV", "sensitivity", "specificity")
+    res[[i]] <- temp_res
+  }
+  res <- data.frame(do.call(rbind, res))
+  res <- rbind(res, (apply(res, 2, mean, na.rm = T)))
+  rownames(res) <- c(categories, "average")
+  return(res)
+}
+custom_evaluate(res_word)
+custom_evaluate(res_pca)
+custom_evaluate(res_abundance)
+```
+## ROC Graph
+an ROC Graph is a graphical plot that illustrates the diagnostic ability of a binary classifier system as its discrimination threshold is varied. The ROC curve is created by plotting the true positive rate (TPR) against the false positive rate (FPR) at various threshold settings.
+```{r, echo = FALSE, message= F}
+pred_word_test_prob <- base::as.data.frame(predict(word_model, rf_word_test, type = "prob"))
+pred_pca_test_prob <- base::as.data.frame(predict(pca_model, rf_pca_test, type = "prob"))
+pred_abundance_test_prob <- base::as.data.frame(predict(abundance_model, rf_abundance_test, type = "prob"))
+
+
+#For use in an R notebook the following plot lines must be run outside of a loop all at once.
+prob <- pred_word_test_prob; test = rf_word_test
+{n <- ncol(prob)
+categories = colnames(prob)
+colors = topo.colors(n = n)
+prob$predict <- names(prob)[1:n][apply(prob[,1:n],1,which.max)]
+prob$observed <- test$feature
+res.roc <- roc(ifelse(prob$observed == categories[1], categories[1], "."), as.numeric(prob[,1]))
+plot(res.roc, col = colors[1], main = "ROC Word")
+word.auc <- NULL
+word.auc[1] <- res.roc$auc
+if(sum(prob$observed == categories[2]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[2], categories[2], "."), as.numeric(prob[,2]))
+lines(temp.roc, col = colors[2])
+word.auc[2] <- temp.roc$auc
+}
+if(sum(prob$observed == categories[3]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[3], categories[3], "."), as.numeric(prob[,3]))
+lines(temp.roc, col = colors[3])
+word.auc[3] <- temp.roc$auc
+}
+if(sum(prob$observed == categories[4]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[4], categories[4], "."), as.numeric(prob[,4]))
+lines(temp.roc, col = colors[4])
+word.auc[4] <- temp.roc$auc
+}
+if(sum(prob$observed == categories[5]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[5], categories[5], "."), as.numeric(prob[,5]))
+lines(temp.roc, col = colors[5])
+word.auc[5] <- temp.roc$auc
+}
+if(sum(prob$observed == categories[6]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[6], categories[6], "."), as.numeric(prob[,6]))
+lines(temp.roc, col = colors[6])
+word.auc[6] <- temp.roc$auc
+}
+legend(0.25, 0.5, legend=categories[categories %in% unique(prob$observed)], col=colors[categories %in% unique(prob$observed)], lty=1, cex=0.7)
+} #plot ROC
+prob <- pred_pca_test_prob; test = rf_word_test
+{n <- ncol(prob)
+categories = colnames(prob)
+colors = topo.colors(n = n)
+prob$predict <- names(prob)[1:n][apply(prob[,1:n],1,which.max)]
+prob$observed <- test$feature
+res.roc <- roc(ifelse(prob$observed == categories[1], categories[1], "."), as.numeric(prob[,1]))
+plot(res.roc, col = colors[1], main = "ROC PCA")
+pca.auc <- NULL
+pca.auc[1] <- res.roc$auc
+if(sum(prob$observed == categories[2]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[2], categories[2], "."), as.numeric(prob[,2]))
+lines(temp.roc, col = colors[2])
+pca.auc[2] <- temp.roc$auc
+}
+if(sum(prob$observed == categories[3]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[3], categories[3], "."), as.numeric(prob[,3]))
+lines(temp.roc, col = colors[3])
+pca.auc[3] <- temp.roc$auc
+}
+if(sum(prob$observed == categories[4]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[4], categories[4], "."), as.numeric(prob[,4]))
+lines(temp.roc, col = colors[4])
+pca.auc[4] <- temp.roc$auc
+}
+if(sum(prob$observed == categories[5]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[5], categories[5], "."), as.numeric(prob[,5]))
+lines(temp.roc, col = colors[5])
+pca.auc[5] <- temp.roc$auc
+}
+if(sum(prob$observed == categories[6]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[6], categories[6], "."), as.numeric(prob[,6]))
+lines(temp.roc, col = colors[6])
+pca.auc[6] <- temp.roc$auc
+}
+legend(0.25, 0.5, legend=categories[categories %in% unique(prob$observed)], col=colors[categories %in% unique(prob$observed)], lty=1, cex=0.7)
+} #plot ROC
+prob <- pred_abundance_test_prob; test = rf_word_test
+{n <- ncol(prob)
+categories = colnames(prob)
+colors = topo.colors(n = n)
+prob$predict <- names(prob)[1:n][apply(prob[,1:n],1,which.max)]
+prob$observed <- test$feature
+res.roc <- roc(ifelse(prob$observed == categories[1], categories[1], "."), as.numeric(prob[,1]))
+plot(res.roc, col = colors[1], main = "ROC relative abundance")
+ra.auc <- NULL
+ra.auc[1] <- res.roc$auc
+if(sum(prob$observed == categories[2]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[2], categories[2], "."), as.numeric(prob[,2]))
+lines(temp.roc, col = colors[2])
+ra.auc[2] <- temp.roc$auc
+}
+if(sum(prob$observed == categories[3]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[3], categories[3], "."), as.numeric(prob[,3]))
+lines(temp.roc, col = colors[3])
+ra.auc[3] <- temp.roc$auc
+}
+if(sum(prob$observed == categories[4]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[4], categories[4], "."), as.numeric(prob[,4]))
+lines(temp.roc, col = colors[4])
+ra.auc[4] <- temp.roc$auc
+}
+if(sum(prob$observed == categories[5]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[5], categories[5], "."), as.numeric(prob[,5]))
+lines(temp.roc, col = colors[5])
+ra.auc[5] <- temp.roc$auc
+}
+if(sum(prob$observed == categories[6]) > 0){
+temp.roc <- roc(ifelse(prob$observed == categories[6], categories[6], "."), as.numeric(prob[,6]))
+lines(temp.roc, col = colors[6])
+ra.auc[6] <- temp.roc$auc
+}
+legend(0.25, 0.5, legend=categories[categories %in% unique(prob$observed)], col=colors[categories %in% unique(prob$observed)], lty=1, cex=0.7)
+} 
+
+## summary AUC table
+summary_auc <- rbind(word.auc, pca.auc, ra.auc)
+summary_auc <- rbind(summary_auc, apply(summary_auc, 2, mean, na.rm = T))
+summary_auc <- cbind(summary_auc, apply(summary_auc, 1, mean, na.rm = T))
+colnames(summary_auc) <- c(categories, "average")
+rownames(summary_auc) <- c("word", "pca", "relative abundance", "average")
+summary_auc
+```
