@@ -106,7 +106,7 @@ testing <- testing(current); dim(testing) #10% testing
 Before we run our models. We first subset each space into a training and test set, also cross-validation. 
 ```{r}
 
-cv_train <- mutate(vfold_cv(training, v = 3, repeats = 10),
+cv_train <- mutate(vfold_cv(training, v = 3, repeats = 10, strata = "response"),
                   df_ana = map (splits,  analysis),
                   df_ass = map (splits,  assessment))
 
@@ -149,6 +149,7 @@ temp_names<- expand.grid(unique(names(a)), 1:(length(names(a))/length(unique(nam
 names(a) <- temp_names;names(b) <- temp_names
 cv_rf0 <- mapply(training = a, testing = b, my_rf, SIMPLIFY = F)
 cv_rf <- unlist(cv_rf0, recursive = F, use.names = T)
+#lapply(cv_rf, ncol) %>% unlist()
 ```
 ## Model Performance
 After running the model, we can evaluate model performance using multiple metrics;
@@ -225,4 +226,14 @@ pr_curves %>%
 ```
 ## Bootstrap confidence intervals
 ```{r}
+quantiles_95 <- function(x) {
+  r <- quantile(x, probs=c(0.05, 0.25, 0.5, 0.75, 0.95))
+  names(r) <- c("ymin", "lower", "middle", "upper", "ymax")
+  r
+}  
+ggplot(stats,aes(x = .metric, y = .estimate)) +
+    guides(fill=F) +
+    stat_summary(fun.data = quantiles_95, geom="boxplot") + 
+    facet_wrap(~.set) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
 ```
