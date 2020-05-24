@@ -1,0 +1,9 @@
+.metric,.estimator,.estimate
+ppv,macro,NA
+npv,macro,NA
+sens,macro,0.3333333333333333
+spec,macro,0.8511904761904762
+accuracy,multiclass,0.3
+kap,multiclass,0.1025641025641025
+pr_auc,macro,NA
+roc_auc,hand_till,NA

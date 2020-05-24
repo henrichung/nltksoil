@@ -32,68 +32,106 @@ title <- "word"
 #title <- "pca"
 #title <- "abundance"
   #join with metadata
-rf <- rf_word0 %>%
+
+rf <- rf_word %>%
   left_join(soil_data, by = "X.SampleID") %>%
   mutate(response = envo_biome_2) %>%
   select( matches("V[0-9]{2}|response")) %>%
   mutate(response = gsub(" ", "_", response)) %>%
   mutate(response = gsub("_biome", "", response)) %>%
   mutate(response = as.factor(response))
-  
+
 #split into setaside, training, testing
-split <-initial_split(rf, prop = 0.9) 
-setaside <- testing(split) #10% set aside
-current <- initial_split(training(split), prop = 8/9)
-training <- training(current) #80% training
-testing <- testing(current) #10% testing
+split <-initial_split(rf, prop = 9/10) 
+setaside <- testing(split); dim(setaside) #10% set aside
+current <- initial_split(training(split), prop = 8/9); dim(current)
+training <- training(current); dim(training) #80% training
+testing <- testing(current); dim(testing) #10% testing
 
-#fit random forest model
-model <-  rand_forest(mode = "classification") %>%
-  set_engine("randomForest") %>%
-  fit(response ~ ., data = training) 
 
-#predict on training set
-m_train <- predict(model, training) %>% bind_cols(training)
-#predict on testing set
-m_test <- predict(model,testing) %>% bind_cols(testing)
+cv_train <- mutate(vfold_cv(training, v = 3, repeats = 10),
+                   df_ana = map (splits,  analysis),
+                   df_ass = map (splits,  assessment))
 
-#probability predictions
-mp_test <- predict(model, testing, type = "prob") %>%
-  bind_cols(m_test) %>%
-  select(-matches("V.{2}")) %>%
-  rename(estimate = .pred_class) 
-
-mp_train <- predict(model, training, type = "prob") %>%
-  bind_cols(m_train) %>%
-  select(-matches("V.{2}")) %>%
-  rename(estimate = .pred_class)
-##
-multi_metric <- metric_set(ppv, npv, sens, spec, precision, recall, accuracy,kap, pr_auc, roc_auc)
-stats_train <- multi_metric(mp_train, truth = response, estimate = estimate,... = matches(".pred.*"));stats_train
-write_csv(stats_train, paste(outputFolder, title, "_stats_train.csv", sep = ""))
-stats_test <- multi_metric(mp_test, truth = response, estimate = estimate, ... = matches(".pred.*")); stats_test
-write_csv(stats_test, paste(outputFolder, title, "_stats_test.csv", sep = ""))
-
-custom_stats_train <- custom_evaluate(conf_mat(mp_train, response, estimate)$table); custom_stats_train
-write.csv(custom_stats_train, paste(outputFolder, title, "_customstats_train.csv", sep = ""))
-custom_stats_test <- custom_evaluate(conf_mat(mp_test, response, estimate)$table); custom_stats_test
-write.csv(custom_stats_test, paste(outputFolder, title, "_customstats_test.csv", sep = ""))
-
-##
-roc_curve(mp_train, ... = matches(".pred.*"), truth = response) %>% autoplot()
-ggsave(paste(outputFolder, title, "_train_roc.svg", sep = ""), width = 9, height = 6)
-pr_curve(mp_train, ... = matches(".pred.*"), truth = response) %>% autoplot()
-ggsave(paste(outputFolder, title, "_train_pr.svg", sep = ""),  width = 9, height = 6)
-roc_curve(mp_test, ... = matches(".pred.*"), truth = response) %>% autoplot()
-ggsave(paste(outputFolder, title, "_test_roc.svg", sep = ""),  width = 9, height = 6)
-pr_curve(mp_test, ... = matches(".pred.*"), truth = response) %>% autoplot()
-ggsave(paste(outputFolder, title, "_test_pr.svg", sep = ""),  width = 9, height = 6)
-##
-mp_test %>% conf_mat(response, estimate) %>% autoplot(type = "heatmap") 
-ggsave(paste(outputFolder, title, "_train_heatmap.svg", sep = ""),  width = 9, height = 9)
-mp_train %>% conf_mat(response, estimate) %>% autoplot(type = "heatmap") 
-ggsave(paste(outputFolder, title, "_test_heatmap.svg", sep = ""), width = 9, height = 9)
-##
+my_rf <- function(training, testing){
+  #remove empty classes
+  training <- mutate(training, response = droplevels(response))
+  testing <- mutate(testing, response = droplevels(response))
+  
+  #set model
+  model <-  rand_forest(mode = "classification") %>%
+    set_engine("randomForest") %>%
+    fit(response ~ ., data = training) 
+  
+  #predict on training set
+  m_train <- predict(model, training) %>% bind_cols(training) %>%
+    mutate(estimate = .pred_class) %>%
+    select(c(estimate, response)) #classification
+  mp_train <- predict(model, training, type = "prob") %>%
+    bind_cols(m_train) #probabilities
+  
+  #predict on testing set
+  m_test <- predict(model,testing) %>% bind_cols(testing)%>%
+    mutate(estimate = .pred_class) %>%
+    select(c(estimate, response)) #classification
+  #probability predictions
+  mp_test <- predict(model, testing, type = "prob") %>%
+    bind_cols(m_test) #probabilities
+  
+  res <- list()
+  res[[1]] <- mp_train
+  res[[2]] <- mp_test
+  names(res) <- c("train", "test")
+  return(res)
 }
+a <- as.list(cv_train$df_ana)
+b <- as.list(cv_train$df_ass)
+temp_names<- expand.grid(unique(names(a)), 1:(length(names(a))/length(unique(names(a))))) %>% 
+  unite(name, c(Var1, Var2), sep = ".") %>%
+  dplyr::pull(name)
+names(a) <- temp_names;names(b) <- temp_names
+cv_rf0 <- mapply(training = a, testing = b, my_rf, SIMPLIFY = F)
+cv_rf <- unlist(cv_rf0, recursive = F, use.names = T)
 
+###
+multi_metric <- metric_set(ppv, npv, sens, spec,accuracy,kap, pr_auc, roc_auc)
+
+error_multi_metric <- function (x) {
+  return(tryCatch(multi_metric(x, truth = response, estimate = estimate, ... = matches(".pred.*"), na_rm = TRUE), error=function(e) NULL))
+}
+stats <- lapply(cv_rf, error_multi_metric) %>%
+  bind_rows(.id = ".fold") %>%
+  separate(.fold, c(".sample",".fold",".set"), sep = "\\.")
+
+custom_stats <- lapply(cv_rf, custom_evaluate) %>%
+  bind_rows(.id = ".fold") %>%
+  separate(.fold, c(".sample",".fold",".set"), sep = "\\.")
+
+write_csv(stats, paste(outputFolder, title, "_stats.csv", sep = ""))
+write_csv(custom_stats, paste(outputFolder, title, "_customstats.csv", sep = ""))
+###
+roc_curves <- lapply(cv_rf, custom_roc_curve) %>%
+  bind_rows(.id = ".fold") %>%
+  separate(.fold, c(".sample",".fold",".set"), sep = "\\.")
+
+roc_curves %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = .fold, type = .sample)) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  facet_grid(.set~.level)
+
+pr_curves <- lapply(cv_rf, custom_pr_curve) %>%
+  bind_rows(.id = ".fold") %>%
+  separate(.fold, c(".sample",".fold",".set"), sep = "\\.")
+pr_curves %>%
+  ggplot(aes(x = recall, y = precision, color = .fold, type = .sample)) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  facet_grid(.set~.level)
 

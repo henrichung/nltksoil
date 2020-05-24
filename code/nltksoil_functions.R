@@ -15,9 +15,10 @@ to_sparse <- function(d_table){
 custom_evaluate <- function(x){
   res <- list()
   temp <- x %>%
+    select(c(estimate, response)) %>%
+    table() %>%
     as.data.frame() %>%
     mutate(Freq = as.numeric(Freq))
-  sum <- sum(temp$Freq)
   colnames(temp) <- c("predict", "observed", "Freq")
   temp <- temp %>%
     mutate(predict = as.character(predict), observed = as.character(observed))
@@ -36,13 +37,27 @@ custom_evaluate <- function(x){
     NPV <- TN/(FN+TN)
     sensitivity <- TP/(TP+FN)
     specificity <- TN/(FP+TN)
-    temp_res <- as.numeric(c(TP/sum, FP/sum, TN/sum, FN/sum, PPV, NPV, sensitivity, specificity))
+    temp_res <- as.numeric(c(TP, FP, TN, FN, PPV, NPV, sensitivity, specificity))
     names(temp_res) <- c("TP", "FP", "TN", "FN", "PPV", "NPV", "sensitivity", "specificity")
     res[[i]] <- temp_res
   }
   res <- data.frame(do.call(rbind, res))
   res <- rbind(res, (apply(res, 2, mean, na.rm = T)))
   rownames(res) <- c(categories, "average")
+  return(res)
+}
+
+return(tryCatch(multi_metric(x, truth = response, estimate = estimate, ... = matches(".pred.*"), na_rm = TRUE), error=function(e) NULL))
+
+custom_roc_curve <- function(x){
+  levels <- paste(as.character(unique(x$response)), collapse = "|")
+  res <- return(tryCatch(roc_curve(x, ... = matches(levels), truth = response), error=function(e) NULL))
+  return(res)
+}
+
+custom_pr_curve <- function(x){
+  levels <- paste(as.character(unique(x$response)), collapse = "|")
+  res <- return(tryCatch(pr_curve(x, ... = matches(levels), truth = response), error=function(e) NULL))
   return(res)
 }
 #Python stuff

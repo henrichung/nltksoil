@@ -27,93 +27,65 @@ new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"
 if(length(new.packages)) install.packages(new.packages)
 lapply(list.of.packages, library, character.only = TRUE)
 ```
+##Load data and set parameters
 ```{r}
 #clear environment
 rm(list = ls())
-
+source("nltk_functions.R")
 #folders
 dataFolder <- "../data/"
 outputFolder <- "../output/"
-OTU_filename <- "emp_cr_gg_13_8.subset_2k.biom"                    #2k subset of EMP data
-sample_filename <- "emp_qiime_mapping_subset_2k.tsv"
 title = "word_example"
-#load the data
-OTU_file <- paste(dataFolder, OTU_filename, sep = "")
-sample_file <- paste(dataFolder, sample_filename, sep = "")
 
-biomf <- biomformat::read_biom(OTU_file)
-OTU_table <- biomformat::biom_data(biomf)
-rm(biomf)
-sample_data <- read_tsv(sample_file)
+#load data
+OTU_working <- readRDS(paste(dataFolder, "OTU_working.RDS", sep = ""))
+soil_data <- readRDS(paste(dataFolder, "soil_data.RDS", sep = "")) %>%
+  filter(X.SampleID %in% colnames(OTU_working))
 
-#Preview data
-dim(OTU_table) #2000 samples with 66901 unique taxa
-dim(sample_data) #200 samples with 76 metadata columns
-head(sample_data[1:10,1:10])
+#preview data
+head(OTU_working[1:10, 1:10])
+head(soil_data[1:10, 1:10])
+
 ```
 
-## Reshape data
-Here we reshape the data by filtering samples that contain "soil" within their description. After filtering, we remove taxa that are not present in any of the soil samples. This reduces the dimensions of our interest data.
-```{r}
-int_data <- dplyr::filter(sample_data, grepl('soil', Description)) %>% #filter data into description
-  mutate(feature = envo_biome_2) #define feature of interest as envo_biome_2
-int_filter <- dplyr::pull(int_data, "#SampleID") #pull sample names with soil in description
-
-
-
-OTU_sub <- OTU_table[,int_filter] #subset to only soil samples
-OTU_sub <- OTU_sub[!Matrix::rowSums(OTU_sub) == 0 ,] #remove rows with no taxa
-dim(OTU_sub) #27472 unique taxa with 65 soil samples.
-head(OTU_sub[1:10,1:10])
-```
-
-## Model Features
+## Train Word Embeddings
 Next, we use GloVe and Principal Componenet Analysis to transform the taxa counts into the corresponding taxa-property transformation space. For the GloVe algorithm, we use the function "Dtm2Tcm", which converts a document taxa matrix into a term co-occurence matrix. In this case, each bacterial "sample", represents a document while each "taxa" represent a term. Bacterial counts per sample are equivalent to "terms" within a "document" in the natural language analysis framework. 
 ```{r}
-##GloVe Algorithm
-#(slow) < 3 minutes, limited by RAM
-cooccur_table <- textmineR::Dtm2Tcm(t(OTU_sub)) #converts a document term matrix into a term co-occurence matrix. 
-#define hyperparameters for glove model
-glove = GlobalVectors$new(rank = 50, x_max = 10) 
-#fit main glove model word vectors
-#using an intel i5 and GTX1060 3GB this step took approximately 10 minutes
-wv_main = glove$fit_transform(cooccur_table, n_iter = 10, convergence_tol = 0.01, n_threads = 8)
-#pull out context word vectors
+## Section B: Train Word Embeddings
+##################################################
+cooccur_table <- Dtm2Tcm(t(OTU_working)) #create cooccurence table
+glove = GlobalVectors$new(rank = 50, x_max = 10) #hyperparameters
+wv_main = glove$fit_transform(cooccur_table, n_iter = 10, convergence_tol = 0.01, n_threads = 8) #run glove algorithm
 wv_context = glove$components
 dim(wv_context)
-#combine main and context word vectors
 word_vectors = wv_main + t(wv_context)
-rf_word <- crossprod(x = word_vectors, y = OTU_sub) %>% 
-  t() %>% 
-  as.data.frame() %>% 
-  rownames_to_column() %>%
-  rename(X.SampleID = rowname)
-##PCR embeddings
-pca_embeddings <- prcomp(t(OTU_sub),rank = 50)$rotation #50 principal components
-rf_pca <- crossprod(x = pca_embeddings, y = OTU_sub) %>%
-  t() %>% 
-  as.data.frame() %>% 
-  rownames_to_column()%>%
-  rename(X.SampleID = rowname)
-#relative abundance
-rf_abundance <- apply(OTU_sub, MARGIN = 2, FUN = function(x){x/sum(x)}) %>%
-  as.matrix() %>%
+
+rf_word <- crossprod(x = word_vectors, y = OTU_working) %>%
   t() %>%
   as.data.frame() %>%
-  rownames_to_column("X.SampleID")
+  tibble::rownames_to_column(var = "X.SampleID")
 
-head(rf_word[1:10,1:10])
-#head(rf_pca[1:10,1:10])
-#head(rf_abundance[1:10,1:10])
+## Section C: PCR Embeddings
+##################################################
+pcr_embeddings <- prcomp(t(OTU_working),rank = 50)$rotation
+
+#pca
+rf_pca <- crossprod(x = pcr_embeddings, y = OTU_working) %>%
+  t() %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "X.SampleID")
+
+## Section D: Relative Abundance 
+##################################################
+rf_abundance <- apply(OTU_working, MARGIN = 2, FUN = function(x){x/sum(x)}) %>%
+  as.matrix() %>%
+  t()
 ```
+
+
 ## Further Reshaping
 After creating our taxa-property space, we add a column representing the metadata feature we are trying to predict to each dataframe. This is for ease of use of the Random Forest functionm which takes in a dataframe and predicts the values within a column of interest based on the other columns within the dataframe. 
 ```{r}
-soil_data <-  dplyr::filter(sample_data, grepl('soil', Description)) %>%
-  rename(X.SampleID = "#SampleID") %>%
-  filter(X.SampleID %in% rf_word$X.SampleID) 
-
-
 rf <- rf_word %>%
   left_join(soil_data, by = "X.SampleID") %>%
   mutate(response = envo_biome_2) %>%
@@ -123,37 +95,60 @@ rf <- rf_word %>%
   mutate(response = as.factor(response))
   
 #split into setaside, training, testing
-split <-initial_split(rf, prop = 0.9) 
-setaside <- testing(split) #10% set aside
-current <- initial_split(training(split), prop = 8/9)
-training <- training(current) #80% training
-testing <- testing(current) #10% testing
+split <-initial_split(rf, prop = 9/10) 
+setaside <- testing(split); dim(setaside) #10% set aside
+current <- initial_split(training(split), prop = 8/9); dim(current)
+training <- training(current); dim(training) #80% training
+testing <- testing(current); dim(testing) #10% testing
 
 ```
 ## Train Models
-Before we run our models. We first subset each space into a training and test set.
+Before we run our models. We first subset each space into a training and test set, also cross-validation. 
 ```{r}
-#fit random forest model
-model <-  rand_forest(mode = "classification") %>%
+
+cv_train <- mutate(vfold_cv(training, v = 3, repeats = 10),
+                  df_ana = map (splits,  analysis),
+                  df_ass = map (splits,  assessment))
+
+my_rf <- function(training, testing){
+  #remove empty classes
+  training <- mutate(training, response = droplevels(response))
+  testing <- mutate(testing, response = droplevels(response))
+  
+  #set model
+  model <-  rand_forest(mode = "classification") %>%
   set_engine("randomForest") %>%
   fit(response ~ ., data = training) 
-
-#predict on training set
-m_train <- predict(model, training) %>% bind_cols(training)
-#predict on testing set
-m_test <- predict(model,testing) %>% bind_cols(testing)
-
-#probability predictions
-mp_test <- predict(model, testing, type = "prob") %>%
-  bind_cols(m_test) %>%
-  select(-matches("V.*")) %>%
-  rename(estimate = .pred_class)
-
-mp_train <- predict(model, training, type = "prob") %>%
-  bind_cols(m_train) %>%
-  select(-matches("V.*")) %>%
-  rename(estimate = .pred_class)
-##
+  
+  #predict on training set
+  m_train <- predict(model, training) %>% bind_cols(training) %>%
+    mutate(estimate = .pred_class) %>%
+    select(c(estimate, response)) #classification
+  mp_train <- predict(model, training, type = "prob") %>%
+    bind_cols(m_train) #probabilities
+  
+  #predict on testing set
+  m_test <- predict(model,testing) %>% bind_cols(testing)%>%
+    mutate(estimate = .pred_class) %>%
+    select(c(estimate, response)) #classification
+  #probability predictions
+  mp_test <- predict(model, testing, type = "prob") %>%
+    bind_cols(m_test) #probabilities
+  
+  res <- list()
+  res[[1]] <- mp_train
+  res[[2]] <- mp_test
+  names(res) <- c("train", "test")
+  return(res)
+}
+a <- as.list(cv_train$df_ana)
+b <- as.list(cv_train$df_ass)
+temp_names<- expand.grid(unique(names(a)), 1:(length(names(a))/length(unique(names(a))))) %>% 
+  unite(name, c(Var1, Var2), sep = ".") %>%
+  dplyr::pull(name)
+names(a) <- temp_names;names(b) <- temp_names
+cv_rf0 <- mapply(training = a, testing = b, my_rf, SIMPLIFY = F)
+cv_rf <- unlist(cv_rf0, recursive = F, use.names = T)
 ```
 ## Model Performance
 After running the model, we can evaluate model performance using multiple metrics;
@@ -178,49 +173,21 @@ After running the model, we can evaluate model performance using multiple metric
 All of these metrics are calculated using yardstick functions, which calculates these values for a multi-class classifier by taking the average of each score calculated for each class using all-vs-one calculations. To compare these results, we also use a custom statistics function that calculates the values for each class individually and then recalculates the average. We can check the accuracy of our custom function by comparing our average to the parsnip output. 
 ##statistic metrics
 ```{r, echo = TRUE, warning = F}
-multi_metric <- metric_set(ppv, npv, sens, spec, precision, recall, accuracy,kap, pr_auc, roc_auc)
-stats_train <- multi_metric(mp_train, truth = response, estimate = estimate,... = matches(".pred.*"));stats_train
-write_csv(stats_train, paste(outputFolder, title, "_stats_train.csv", sep = ""))
-stats_test <- multi_metric(mp_test, truth = response, estimate = estimate, ... = matches(".pred.*")); stats_test
-write_csv(stats_test, paste(outputFolder, title, "_stats_test.csv", sep = ""))
+multi_metric <- metric_set(ppv, npv, sens, spec,accuracy,kap, pr_auc, roc_auc)
 
-
-custom_evaluate <- function(x){
-  res <- list()
-  temp <- x %>%
-    as.data.frame() %>%
-    mutate(Freq = as.numeric(Freq))
-  colnames(temp) <- c("predict", "observed", "Freq")
-  temp <- temp %>%
-    mutate(predict = as.character(predict), observed = as.character(observed))
-  categories <- unique(temp$predict)
-  for(i in 1:length(categories)){
-    subject = categories[i]
-    TP <- filter(temp, observed == subject & predict == subject) %>% 
-      summarize(n = sum(Freq))
-    FP <- filter(temp, observed != subject & predict == subject) %>% 
-      summarize(n = sum(Freq))
-    TN <- filter(temp, observed != subject & predict != subject) %>% 
-      summarize(n = sum(Freq))
-    FN <- filter(temp, observed == subject & predict != subject) %>% 
-      summarize(n = sum(Freq))
-    PPV <- TP/(TP+FP)
-    NPV <- TN/(FN+TN)
-    sensitivity <- TP/(TP+FN)
-    specificity <- TN/(FP+TN)
-    temp_res <- as.numeric(c(TP, FP, TN, FN, PPV, NPV, sensitivity, specificity))
-    names(temp_res) <- c("TP", "FP", "TN", "FN", "PPV", "NPV", "sensitivity", "specificity")
-    res[[i]] <- temp_res
-  }
-  res <- data.frame(do.call(rbind, res))
-  res <- rbind(res, (apply(res, 2, mean, na.rm = T)))
-  rownames(res) <- c(categories, "average")
-  return(res)
+error_multi_metric <- function (x) {
+  return(tryCatch(multi_metric(x, truth = response, estimate = estimate, ... = matches(".pred.*"), na_rm = TRUE), error=function(e) NULL))
 }
-custom_stats_train <- custom_evaluate(conf_mat(mp_train, response, estimate)$table); custom_stats_train
-write_csv(custom_stats_train, paste(outputFolder, title, "_customstats_train.csv", sep = ""))
-custom_stats_test <- custom_evaluate(conf_mat(mp_test, response, estimate)$table); custom_stats_test
-write_csv(custom_stats_test, paste(outputFolder, title, "_customstats_test.csv", sep = ""))
+stats <- lapply(cv_rf, error_multi_metric) %>%
+  bind_rows(.id = ".fold") %>%
+  separate(.fold, c(".sample",".fold",".set"), sep = "\\.")
+
+custom_stats <- lapply(cv_rf, custom_evaluate) %>%
+  bind_rows(.id = ".fold") %>%
+  separate(.fold, c(".sample",".fold",".set"), sep = "\\.")
+
+write_csv(stats, paste(outputFolder, title, "_stats.csv", sep = ""))
+write_csv(custom_stats, paste(outputFolder, title, "_customstats.csv", sep = ""))
 ```
 
 ## ROC and PR Graph
@@ -228,19 +195,34 @@ an ROC Graph is a graphical plot that illustrates the diagnostic ability of a bi
 
 A precision-recall curve is a plot of the precision (y-axis) and the recall (x-axis) for different thresholds, much like the ROC curve.
 ```{r, echo = FALSE, message= F}
+
+roc_curves <- lapply(cv_rf, custom_roc_curve) %>%
+  bind_rows(.id = ".fold") %>%
+  separate(.fold, c(".sample",".fold",".set"), sep = "\\.")
+
+roc_curves %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = .fold, type = .sample)) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  facet_grid(.set~.level)
+
+pr_curves <- lapply(cv_rf, custom_pr_curve) %>%
+  bind_rows(.id = ".fold") %>%
+  separate(.fold, c(".sample",".fold",".set"), sep = "\\.")
+pr_curves %>%
+  ggplot(aes(x = recall, y = precision, color = .fold, type = .sample)) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  facet_grid(.set~.level)
+
 ##
-roc_curve(mp_train, ... = matches(".pred.*"), truth = response) %>% autoplot()
-ggsave(paste(outputFolder, title, "_train_roc.pdf", sep = ""), width = 9, height = 6)
-pr_curve(mp_train, ... = matches(".pred.*"), truth = response) %>% autoplot()
-ggsave(paste(outputFolder, title, "_train_pr.pdf", sep = ""),  width = 9, height = 6)
-#roc_curve(mp_test, ... = matches(".pred.*"), truth = response) %>% autoplot()
-ggsave(paste(outputFolder, title, "_test_roc.pdf", sep = ""),  width = 9, height = 6)
-pr_curve(mp_test, ... = matches(".pred.*"), truth = response) %>% autoplot()
-ggsave(paste(outputFolder, title, "_train_roc.pdf", sep = ""),  width = 9, height = 6)
-##
-mp_test %>% conf_mat(response, estimate) %>% autoplot(type = "heatmap") 
-ggsave(paste(outputFolder, title, "_train_heatmap.pdf", sep = ""),  width = 9, height = 9)
-mp_train %>% conf_mat(response, estimate) %>% autoplot(type = "heatmap") 
-ggsave(paste(outputFolder, title, "_test_heatmap.pdf", sep = ""), width = 9, height = 9)
-##
+```
+## Bootstrap confidence intervals
+```{r}
 ```

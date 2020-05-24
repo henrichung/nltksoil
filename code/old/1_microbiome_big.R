@@ -54,6 +54,7 @@ int_filter <- int_filter[int_filter %in% column_names] #subset names with soil w
 OTU_table <- to_sparse(OTU_table)
 OTU_int <- OTU_table[,int_filter]
 OTU_sub <- OTU_int[!Matrix::rowSums(OTU_int) == 0 ,]
+saveRDS(OTU_sub, "data/OTU_sub.RDS")
 #train word embedding
 cooccur_table <- Dtm2Tcm(t(OTU_sub))
 glove = GlobalVectors$new(rank = 50, x_max = 10)
