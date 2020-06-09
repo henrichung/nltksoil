@@ -1,0 +1,10 @@
+The EMP Release 1 repository contains the following files and directories:
+
+about_mapping_files.md - description of mapping files and subsets of the dataset
+about_otu_tables.pdf - flowchart for choosing the right BIOM table for you
+emp_ontology/ - text file describing EMP Sample Type Ontology (EMPO)
+mapping_files/ - mapping files for each subset of samples
+otu_distributions/ - OTU & Deblur distribution tables
+otu_info/ - OTU & Deblur information: sequences and trees
+otu_tables/ - OTU & Deblur observation tables
+results/ - alpha- and beta-diversity results

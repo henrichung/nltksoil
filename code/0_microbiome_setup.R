@@ -7,117 +7,87 @@
 ##################################################
 
 ## Section A: Set up libraries and load data
-##################################################
-list.of.packages <- c("textmineR", "tidyverse", "randomForest", "text2vec", "parallel", "pROC")
+list.of.packages <- c("tidyverse", "tidytext", "quanteda", "rsample", "data.table")
 new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
 if(length(new.packages)) install.packages(new.packages)
 lapply(list.of.packages, library, character.only = TRUE)
 
-#clear environment
-rm(list = ls())
-source("code/nltksoil_functions.R")
+rm(list = ls()) #clear environment
+source("code/nltksoil_functions.R") #Load functions
 
-#parameters
-dataFolder <- "data/"
+#set up folder structure
+dataFolder <- "data/"; dir.create(dataFolder, showWarnings = FALSE)
+curr <- format(Sys.time(), "%Y%m%d/") #Set today's date as output
+outputFolder <- paste("output/", curr, sep = ""); dir.create(outputFolder, showWarnings = FALSE)
 
-##Use the following lines with the biom python package to proprocess the .biome file into a tsv for R
-#table = load_table("emp_cr_gg_13_8.qc_filtered.biom") 
-#a = table.ids()  
-#b = a.astype("U") 
-#b.tofile("out.csv", sep="\n", format="%s")   
+#Parameters
+cdebug = TRUE#If using the debugging dataset instead of full (needs a lot of RAM)
+resp = "envo_biome_2" #response variable to use 
+#resp = "ph"
+query = "soil" #sample information to filter from
+#file locations
+sample_filename <- paste(dataFolder, "emp_qiime_mapping_release1.tsv" , sep = "")
+OTU_filename <- paste(dataFolder, "table.from_biom.txt", sep = "")
 
-#file names for EMP database (after python processing)
-OTU_filename <- "table.from_biom.txt"
-sample_filename <- "emp_qiime_mapping_release1.tsv"
-columns_filename <- "out.csv"
-
-OTU_file <- paste(dataFolder, OTU_filename, sep = "")
-sample_file <- paste(dataFolder, sample_filename, sep = "")
-
-#read in with data.table::fread for speed
-OTU_table <- data.table::fread(OTU_file)
-taxa <- OTU_table$`#OTU ID`
-
-#reshape taxa rows
-colnames(OTU_table)[1] <- "temp" #taxa row names is read as first column
-rownames(OTU_table) <- OTU_table$temp #set rownames to that column
-OTU_table <- (OTU_table[,-1]) #remove temp column
+## Section B: Read in metadata 
+##################################################
 
 #filter to soil samples
-sample_data <- read.csv(sample_file, sep = "\t")
-int_data <- dplyr::filter(sample_data, grepl("soil", pull(sample_data["Description"]))) #filter data into description
-int_filter <- dplyr::pull(int_data, "X.SampleID") #pull sample names with soil in description
-saveRDS(int_data, "data/soil_data.RDS")
-#add back column (sample) names
-column_file <- paste(dataFolder, columns_filename, sep = "")
-column_names <- readr::read_csv(column_file, col_names = c("temp")) %>%
-  pull(temp)
-colnames(OTU_table) <- column_names #add column names
-int_filter <- int_filter[int_filter %in% column_names] #subset names with soil with existing column names in data
+sample_data <- read.csv( sample_filename, sep = "\t") %>% 
+  dplyr::filter(grepl(query, Description)) %>% #filter based on Description
+  mutate(response = !!as.name(resp)) %>% 
+  select(c("response", "X.SampleID")) %>%#filter data into description
+  mutate(X.SampleID = as.character(X.SampleID))
+int_filter <- dplyr::pull(sample_data, "X.SampleID") #pull sample names with soil in description
+saveRDS(sample_data, paste(dataFolder, "rds/sample_data.RDS", sep = ""))
 
-#Reshape
-OTU_table <- to_sparse(OTU_table) #convert to sparse matrix object
-OTU_int <- OTU_table[,int_filter] #filter to soil samples
-OTU_sub <- OTU_int[!Matrix::rowSums(OTU_int) == 0 ,] #remove 0 rowSums
-taxa2 <- taxa[!Matrix::rowSums(OTU_int) == 0]
-saveRDS(OTU_sub, "data/OTU_sub.RDS") #save
-saveRDS(taxa2, "data/taxa.RDS")
-#create working subsample for debugging on local machine
-set.seed(12345) #set random seed
-n <- sample(1:ncol(OTU_sub), 100) #sample 100 items
-OTU_working <- OTU_sub[,n] #subset to 100 samples
-OTU_working <- OTU_working[!Matrix::rowSums(OTU_working) == 0,] #remove empty rows
-saveRDS(OTU_working, "data/OTU_working.RDS")
+if(is.numeric(sample_data$response)){NUM = TRUE}else{NUM = FALSE}
 
-#Taxonomy data for abundance
+#Read Taxonomy Data
 taxon <- read_table2(paste(dataFolder, "97_otu_taxonomy.txt", sep = ""), col_names = F) %>%
   mutate_all(funs(gsub("[a-z]__|;", "", .))) %>%
   mutate_all(list(~na_if(.,""))) 
 colnames(taxon) <- c("sample", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+saveRDS(taxon, paste(dataFolder, "rds/taxonomy.RDS", sep = ""))
 
-## Section B: Train Word Embeddings
+#file names for EMP database (after python processing)
+if(cdebug == FALSE){
+  #read in with data.table::fread for speed
+  OTU_table <- data.table::fread(OTU_filename) %>%
+    as_tibble()
+  #reshape taxa rows
+  OTU_table <- column_to_rownames(OTU_table,var =  "#OTU ID")
+  taxa <- rownames(OTU_table)
+  
+  }else{
+  OTU_table <- readRDS(paste(dataFolder, "rds/OTU_working.RDS", sep = ""))
+}
+
+## Section C: Subset OTU dataset by samples of interest 
 ##################################################
-cooccur_table <- Dtm2Tcm(t(OTU_sub)) #create cooccurence table
-glove = GlobalVectors$new(rank = 50, x_max = 10) #hyperparameters
-wv_main = glove$fit_transform(cooccur_table, n_iter = 10, convergence_tol = 0.01, n_threads = 8) #run glove algorithm
-wv_context = glove$components
-dim(wv_context)
-word_vectors = wv_main + t(wv_context)
+int_filter <- int_filter[int_filter %in% colnames(OTU_table)]
 
-word_embeddings <- crossprod(x = word_vectors, y = OTU_sub) %>%
-  t() %>%
-  as.data.frame() %>%
-  tibble::rownames_to_column(var = "X.SampleID")
+OTU_sub <- select(OTU_table, all_of(int_filter)) #filter to soil samples
+OTU_sub <- OTU_sub[!Matrix::rowSums(OTU_sub) == 0 ,] #remove 0 rowSum
+OTU_sub <- rownames_to_column(as.data.frame(t(OTU_sub)), "X.SampleID") %>%
+  left_join(sample_data, by = "X.SampleID") %>%
+  select(-c("X.SampleID")) %>%
+  drop_na(response)
 
-## Section C: PCR Word Embeddings
-##################################################
-pca <- prcomp(t(OTU_sub),rank = 50)$rotation
-pca_embeddings <- crossprod(x = pca, y = OTU_sub) %>%
-  t() %>% 
-  as.data.frame() %>%
-  tibble::rownames_to_column(var = "X.SampleID")
+#SPLIT 
+if(NUM){
+  split <-initial_split(OTU_sub, prop = 9/10) 
+  setaside <- testing(split); dim(setaside) #10% set aside
+  current <- initial_split(training(split), prop = 8/9); dim(current)
+}else{
+split <-initial_split(OTU_sub, prop = 9/10, strata = "response") 
+setaside <- testing(split); dim(setaside) #10% set aside
+current <- initial_split(training(split), prop = 8/9, strata = "response"); dim(current)
+}
 
-## Section D: Relative Abundance 
-##################################################
-abundance_embeddings_raw <- apply(OTU_sub, MARGIN = 2, FUN = function(x){x/sum(x)}) %>%
-  as.matrix() %>%
-  t() %>%
-  as.data.frame() %>%
-  rownames_to_column("X.SampleID")
+saveRDS(setaside, paste(dataFolder, "rds/setaside", resp, ".RDS", sep = ""))
+saveRDS(current, paste(dataFolder, "rds/current", resp, ".RDS", sep = ""))
 
-abundance_embeddings <- abundance_embeddings_raw %>%
-  reshape2::melt(id.vars = "X.SampleID") %>%
-  rename(sample = variable) %>%
-  left_join(taxon, by = "sample") %>%
-  mutate(Phylum = gsub("\\[|\\]", "", Phylum)) %>%
-  group_by(X.SampleID, Phylum) %>%
-  summarise(n = sum(value, na.rm = T)) %>%
-  ungroup() %>%
-  pivot_wider(names_from = Phylum, values_from = n) %>%
-  drop_na()
 
-saveRDS(word_embeddings, "data/word_embeddings.RDS")
-saveRDS(pca_embeddings, "data/pca_embeddings.RDS")
-saveRDS(abundance_embeddings_raw, "data/abundance_embeddings_raw.RDS")
-saveRDS(abundance_embeddings, "data/abundance_embeddings.RDS")
+
 
