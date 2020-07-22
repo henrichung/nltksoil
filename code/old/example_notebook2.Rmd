@@ -1,0 +1,239 @@
+---
+title: "Text Analysis on Soil Microbiome"
+output:
+  html_document:
+    df_print: paged
+---
+
+This purpose of this R notebook is to evaluate the performance on natural language based models on microbiome data to predict environmental traits of interest. We use a GloVe or Global Vectors for Word Representation algorithm to transform taxa-taxa cooccurence data from samples of interest into a taxa-property space. We then train a Random Forest model using this space to predict traits of interest. We compare our GloVe trained model to two other models using principal components and relative abundance. Principal Component Analysis is a common method for dimension reduction in bacterial datasets. The relative abundance trained model represents a baseline for model performance using untransformed/reduced data. 
+
+### Traits of interest
+Based on the metadata available, we predict the highest tier within the provided ontology of environmental biomes that consists of more than one unique term. In the EMP dataset, biome metadata for each sample is categorized in 5 levels; 
+
+  + **Domains** : envo_biome_0 > env_biome_1 > env_biome_2 > env_biome_3 > env_biome_4
+  
+  + **Example** : Biome (1) > terrestrial biome (1) > anthropogenic terrestrial biome (6) > cropland biome (10)
+
+The number in parenthesis represents the number of unique terms in that tier. For this analysis, we predict env_biome_2 which consists of 6 unique biome types; anthropogenic terrestrial, desert, forest, grassland, shrubland, tundra.
+
+For comparison, we also try to predict the principal investigator of each sample. Because we are training our models to aggregated data from multiple studies, we want to check if the properties we are picking up from our data come from environmental correlations and not the study itself. We want to avoid the case where our models only accurately predict sample environments because each sample environment is uniquely tied to a particular study. In an ideal case, our model would be able to discern samples that came from two different environments even if they both came from the same study by the same principal investigator.  
+
+## Environment Set up
+First we set up the necessary libraries, define folder paths, and load data.
+```{r, include = F}
+#load packages
+list.of.packages <- c("textmineR", "tidyverse", "randomForest", "text2vec", "parallel", "pROC", "tidymodels")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, library, character.only = TRUE)
+```
+##Load data and set parameters
+```{r}
+#clear environment
+rm(list = ls())
+source("nltk_functions.R")
+#folders
+dataFolder <- "../data/"
+outputFolder <- "../output/"
+title = "word_example"
+
+#load data
+OTU_working <- readRDS(paste(dataFolder, "OTU_working.RDS", sep = ""))
+soil_data <- readRDS(paste(dataFolder, "soil_data.RDS", sep = "")) %>%
+  filter(X.SampleID %in% colnames(OTU_working))
+
+#preview data
+head(OTU_working[1:10, 1:10])
+head(soil_data[1:10, 1:10])
+
+```
+
+## Train Word Embeddings
+Next, we use GloVe and Principal Componenet Analysis to transform the taxa counts into the corresponding taxa-property transformation space. For the GloVe algorithm, we use the function "Dtm2Tcm", which converts a document taxa matrix into a term co-occurence matrix. In this case, each bacterial "sample", represents a document while each "taxa" represent a term. Bacterial counts per sample are equivalent to "terms" within a "document" in the natural language analysis framework. 
+```{r}
+## Section B: Train Word Embeddings
+##################################################
+cooccur_table <- Dtm2Tcm(t(OTU_working)) #create cooccurence table
+glove = GlobalVectors$new(rank = 50, x_max = 10) #hyperparameters
+wv_main = glove$fit_transform(cooccur_table, n_iter = 10, convergence_tol = 0.01, n_threads = 8) #run glove algorithm
+wv_context = glove$components
+dim(wv_context)
+word_vectors = wv_main + t(wv_context)
+
+rf_word <- crossprod(x = word_vectors, y = OTU_working) %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "X.SampleID")
+
+## Section C: PCR Embeddings
+##################################################
+pcr_embeddings <- prcomp(t(OTU_working),rank = 50)$rotation
+
+#pca
+rf_pca <- crossprod(x = pcr_embeddings, y = OTU_working) %>%
+  t() %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "X.SampleID")
+
+## Section D: Relative Abundance 
+##################################################
+rf_abundance <- apply(OTU_working, MARGIN = 2, FUN = function(x){x/sum(x)}) %>%
+  as.matrix() %>%
+  t()
+```
+
+
+## Further Reshaping
+After creating our taxa-property space, we add a column representing the metadata feature we are trying to predict to each dataframe. This is for ease of use of the Random Forest functionm which takes in a dataframe and predicts the values within a column of interest based on the other columns within the dataframe. 
+```{r}
+rf <- rf_word %>%
+  left_join(soil_data, by = "X.SampleID") %>%
+  mutate(response = envo_biome_2) %>%
+  select( matches("V[0-9]{2}|response")) %>%
+  mutate(response = gsub(" ", "_", response)) %>%
+  mutate(response = gsub("_biome", "", response)) %>%
+  mutate(response = as.factor(response))
+  
+#split into setaside, training, testing
+split <-initial_split(rf, prop = 9/10) 
+setaside <- testing(split); dim(setaside) #10% set aside
+current <- initial_split(training(split), prop = 8/9); dim(current)
+training <- training(current); dim(training) #80% training
+testing <- testing(current); dim(testing) #10% testing
+
+```
+## Train Models
+Before we run our models. We first subset each space into a training and test set, also cross-validation. 
+```{r}
+
+cv_train <- mutate(vfold_cv(training, v = 3, repeats = 10, strata = "response"),
+                  df_ana = map (splits,  analysis),
+                  df_ass = map (splits,  assessment))
+
+my_rf <- function(training, testing){
+  #remove empty classes
+  training <- mutate(training, response = droplevels(response))
+  testing <- mutate(testing, response = droplevels(response))
+  
+  #set model
+  model <-  rand_forest(mode = "classification") %>%
+  set_engine("randomForest") %>%
+  fit(response ~ ., data = training) 
+  
+  #predict on training set
+  m_train <- predict(model, training) %>% bind_cols(training) %>%
+    mutate(estimate = .pred_class) %>%
+    select(c(estimate, response)) #classification
+  mp_train <- predict(model, training, type = "prob") %>%
+    bind_cols(m_train) #probabilities
+  
+  #predict on testing set
+  m_test <- predict(model,testing) %>% bind_cols(testing)%>%
+    mutate(estimate = .pred_class) %>%
+    select(c(estimate, response)) #classification
+  #probability predictions
+  mp_test <- predict(model, testing, type = "prob") %>%
+    bind_cols(m_test) #probabilities
+  
+  res <- list()
+  res[[1]] <- mp_train
+  res[[2]] <- mp_test
+  names(res) <- c("train", "test")
+  return(res)
+}
+a <- as.list(cv_train$df_ana)
+b <- as.list(cv_train$df_ass)
+temp_names<- expand.grid(unique(names(a)), 1:(length(names(a))/length(unique(names(a))))) %>% 
+  unite(name, c(Var1, Var2), sep = ".") %>%
+  dplyr::pull(name)
+names(a) <- temp_names;names(b) <- temp_names
+cv_rf0 <- mapply(training = a, testing = b, my_rf, SIMPLIFY = F)
+cv_rf <- unlist(cv_rf0, recursive = F, use.names = T)
+#lapply(cv_rf, ncol) %>% unlist()
+```
+## Model Performance
+After running the model, we can evaluate model performance using multiple metrics;
+
+ + PPV - meaures the proportion of positive results that are true positive, TP/TP+FP
+ 
+ + NPV -  meaures the proportion of negative results that are true negative, TN/TN+FN
+ 
+ + Sensitivity - measures the proportion of actual positives that are correctly identified (TP/P)
+ 
+ + Specificity - measures the proportion of actual negatives that are correctly identified (TN/N)
+ 
+ + Precision - same as PPV
+ 
+ + Recall - same as Sensitivity
+ 
+ + Accuracy - proportion of correctly categorized responses
+ 
+ + kap - a measure of accuracy that tales into account random change, k = (P_0 - P_e)/(1-P_e) where P_0 is the accuracy and P_e is the probability of chance agreement
+ 
+ + ROC and PR AUC - Area underneath the curve for Reciever Operator Characteristic and Precision Recall Curves. 
+All of these metrics are calculated using yardstick functions, which calculates these values for a multi-class classifier by taking the average of each score calculated for each class using all-vs-one calculations. To compare these results, we also use a custom statistics function that calculates the values for each class individually and then recalculates the average. We can check the accuracy of our custom function by comparing our average to the parsnip output. 
+##statistic metrics
+```{r, echo = TRUE, warning = F}
+multi_metric <- metric_set(ppv, npv, sens, spec,accuracy,kap, pr_auc, roc_auc)
+
+error_multi_metric <- function (x) {
+  return(tryCatch(multi_metric(x, truth = response, estimate = estimate, ... = matches(".pred.*"), na_rm = TRUE), error=function(e) NULL))
+}
+stats <- lapply(cv_rf, error_multi_metric) %>%
+  bind_rows(.id = ".fold") %>%
+  separate(.fold, c(".sample",".fold",".set"), sep = "\\.")
+
+custom_stats <- lapply(cv_rf, custom_evaluate) %>%
+  bind_rows(.id = ".fold") %>%
+  separate(.fold, c(".sample",".fold",".set"), sep = "\\.")
+
+write_csv(stats, paste(outputFolder, title, "_stats.csv", sep = ""))
+write_csv(custom_stats, paste(outputFolder, title, "_customstats.csv", sep = ""))
+```
+
+## ROC and PR Graph
+an ROC Graph is a graphical plot that illustrates the diagnostic ability of a binary classifier system as its discrimination threshold is varied. The ROC curve is created by plotting the true positive rate (TPR) against the false positive rate (FPR) at various threshold settings.
+
+A precision-recall curve is a plot of the precision (y-axis) and the recall (x-axis) for different thresholds, much like the ROC curve.
+```{r, echo = FALSE, message= F}
+
+roc_curves <- lapply(cv_rf, custom_roc_curve) %>%
+  bind_rows(.id = ".fold") %>%
+  separate(.fold, c(".sample",".fold",".set"), sep = "\\.")
+
+roc_curves %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = .fold, type = .sample)) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  facet_grid(.set~.level)
+
+pr_curves <- lapply(cv_rf, custom_pr_curve) %>%
+  bind_rows(.id = ".fold") %>%
+  separate(.fold, c(".sample",".fold",".set"), sep = "\\.")
+pr_curves %>%
+  ggplot(aes(x = recall, y = precision, color = .fold, type = .sample)) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  facet_grid(.set~.level)
+
+##
+```
+## Bootstrap confidence intervals
+```{r}
+quantiles_95 <- function(x) {
+  r <- quantile(x, probs=c(0.05, 0.25, 0.5, 0.75, 0.95))
+  names(r) <- c("ymin", "lower", "middle", "upper", "ymax")
+  r
+}  
+ggplot(stats,aes(x = .metric, y = .estimate)) +
+    guides(fill=F) +
+    stat_summary(fun.data = quantiles_95, geom="boxplot") + 
+    facet_wrap(~.set) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```

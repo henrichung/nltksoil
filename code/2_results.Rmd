@@ -1,0 +1,100 @@
+---
+title: "2. Results"
+author: "Henri Chung"
+date: "7/21/2020"
+output: html_document
+---
+
+```{r setup, eval=FALSE}
+list.of.packages <- c("tidyverse", "parallel", "parsnip", "rsample", "yardstick", "reshape2", 
+                      "dials", "tune", "furrr", "future", "workflows", "recipes", "doParallel", 
+                      "text2vec", "Rcpp", "profvis","Matrix", "themis", "stringi", "data.table", "tictoc")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages, repos = "https://cloud.r-project.org")
+invisible(capture.output(lapply(list.of.packages, library, character.only = TRUE, warn.conflicts = FALSE, quietly = T)))
+rm(list = ls())
+source("code/nltksoil_functions.R") #Load functions
+
+outputFolder <- "../../../../work/idoerg/hchung/outputs/soil"
+##random forest and 50 dimensions
+results_files <- list.files(outputFolder, full.names = T)
+#store results in list
+results_list_validation <- list(); results_list_tune <- list()
+```
+
+### Data Processing
+
+After running our model, we save individual RDS objects for each iteration of the model that we run. We stores these objects in our output folder. In order to analyze the results, we have to combine these individual results table into a cumulative dataframe for plotting. It is also important to make sure the data is in tidy format. 
+
+```{r, eval = FALSE}
+results_files <- list.files(outputFolder) #get files from output folder
+results_filenames <- paste(outputFolder, results_files, sep = "/") #add relative path
+for(i in 1:length(results_filenames)){ #loop over files in folder
+	temp <- readRDS(results_files[i]) #read in each file
+	results_list_tune[[i]] <- temp$tune #store tuning results 
+	results_list_validation[[i]] <- temp$test #store validation results
+	if(i %% 5 == 0){message(i)} #progress indicator
+}
+```
+
+### Bind and process
+
+We can bind our data tables into one cumulative dataframe. We can then calculate model performance metrics for multiclass classifers on our predictions. There are 3 ways to measure multiclass performance.
+
++ **macro averaging** - reduce multiclass predictions to multiple sets of binary (all vs one) predictions, and calcualtes the corresponding metric for each of the binary cases. Each class gets equal weight (bad for imbalanced)
+
++ **weighted macro average** - same as previous except metrics are weighed by existing proportion in data.
+
++ **micro average** - treats the entire dataset as an aggregate results, and calculates 1 metric rather than k metrics averaged together. For example; 
+ ++ Precision_macro = [tp_1 / (tp_1 + fp_1)] + [tp_2 / (tp_2 + fp_2)] / 2
+ ++ Precision_micro [tp_1 + tp_2 / (tp_1 + tp_2) + (fp_1 + fp_2)]
+ 
+For completeness, we use all 3 methods of averaging across all metrics. We include metrics;
+
++ **accuracy** - the proportion of the data that are predicted correctly.
+
++ **bal_accuracy** - Average of sensitivity and specificity
+
++ **f_meas** - Harmonic mean of the precision and recall
+
++ **kap** - accuracy relative to random chance/the proportion of classes in dataset
+
++ **npv** - Proportion of negative identification that were identified correctly
+
++ **ppv/precision** - proportion of positive identifications that were identified correctly
+
++ **recall/sensitivity** - proportion of actual positives that were identified correctly
+
++ **specificity** - the proportion of negatives that are correctly identified as negatives.
+
+```{r, eval = FALSE}
+#list of metrics to use
+multi_metric <- metric_set(accuracy, bal_accuracy, f_meas, kap, mcc,  ppv, precision, recall, sens, spec)
+plan(multiprocess) #parallel processing
+
+results_tune <- results_tune_raw %>%
+	mutate(filename = gsub("envo_biome_2", "envobiome2", filename)) %>% #remove extra underscores from response
+	separate(filename, c(".taxa", ".response", ".model", ".no_components", ".method")) %>% #split filenames by underscores
+	mutate(.method = factor(.method, levels = c("base", "abundance", "transformpca", "transformword", "pca", "word"))) %>% #add factor levels for methods
+  mutate(.no_components = factor(.no_components, levels = c(50, 100, 150, 200, 250, 300))) %>% #add factor levels for no_components
+  mutate(.taxa = factor(.taxa, levels = c("species", "genus","family", "order", "class", "phylum"))) %>%
+  mutate(.macro_weight = future_map(.predictions, multi_metric, estimate = ".pred_class", truth = "response", estimator = "macro_weighted")) %>% #calculated macro weighed stats
+  mutate(.micro = future_map(.predictions, multi_metric, estimate = ".pred_class", truth = "response", estimator = "micro")) %>% #calculate micro weighted stats
+	rename(.macro = .metrics) %>% #default metrics are macro
+	mutate(.custom2 =future_map(.predictions, custom_evaluate)) #use a custom function to predict for each individual class
+saveRDS(results_tune, "results_tune.RDS")
+
+#repeat steps for validation results
+results_validation <- results_validation_raw %>%
+	mutate(filename = gsub("envo_biome_2", "envobiome2", filename)) %>%
+	separate(filename, c(".taxa", ".response", ".model", ".no_components", ".method")) %>%
+	mutate(.method = factor(.method, levels = c("base", "abundance", "transformpca", "transformword", "pca", "word"))) %>%
+  mutate(.no_components = factor(.no_components, levels = c(50, 100, 150, 200, 250, 300))) %>%
+  mutate(.taxa = factor(.taxa, levels = c("species", "genus","family", "order", "class", "phylum"))) %>%
+  mutate(.macro_weight = future_map(.predictions, multi_metric, estimate = ".pred_class", truth = "response", estimator = "macro_weighted")) %>%
+  mutate(.micro = future_map(.predictions, multi_metric, estimate = ".pred_class", truth = "response", estimator = "micro")) %>%
+  rename(.macro = .metrics) %>%
+	mutate(.custom2 = future_map(.predictions, custom_evaluate))
+saveRDS(results_validation, "results_validation.RDS")
+
+```

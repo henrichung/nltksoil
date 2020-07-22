@@ -25,20 +25,21 @@ curr <- format(Sys.time(), "%Y%m%d/") #Set today's date as output
 outputFolder <- paste("output/", curr, sep = ""); dir.create(outputFolder, showWarnings = FALSE)
 
 #Model Parameters
-nfolds = 2
-nrepeats = 2
+nfolds = 10
+nrepeats = 10
 PAR = TRUE
-embedding = "abundance"
-filename <- "currentenvo_biome_2"
+embedding <- args[1]
+filename <- args[2]
 file <- readRDS(paste("data/rds/", filename, ".RDS", sep = ""))    
 taxonomy <- readRDS(paste(dataFolder, "rds/taxonomy.RDS", sep = ""))
 
 training = training(file)
 testing = testing(file)
-rm(file)
+message("loaded files")
 ## Section 
 ##################################################
 if(is.numeric(training$response)){NUM = TRUE}else{NUM = FALSE}
+message(paste("NUM is ", NUM))
 if(NUM == TRUE){
   #regression model
   tune_spec <- rand_forest(
@@ -60,22 +61,28 @@ if(NUM == TRUE){
   cv <- vfold_cv(training, v = nfolds, repeats = nrepeats)
   switch(embedding, 
          "word" = {
-           rec <- recipe(training) %>%
+           rec <- recipe(head(training)) %>%
              update_role(everything()) %>%
-             update_role(response = "outcome") %>% 
+             update_role(response, new_role = "outcome")  %>% 
              step_word(all_predictors()) 
          },
          "pca" = {
-           rec <- recipe(training) %>%
+           rec <- recipe(head(training)) %>%
              update_role(everything()) %>%
-             update_role(response = "outcome") %>% 
+             update_role(response, new_role = "outcome")  %>% 
              step_cpca(all_predictors()) 
          },
          "abundance" = {
-           rec <- recipe(training) %>%
+           rec <- recipe(head(training)) %>%
              update_role(everything()) %>%
-             update_role(response = "outcome") %>%
+             update_role(response, new_role = "outcome")  %>% 
              step_abundance(all_predictors())
+         },
+         "wordsym" = {
+           rec <- recipe(head(training)) %>%
+             update_role(everything()) %>%
+             update_role(response, new_role = "outcome")  %>% 
+             step_wordsym(all_predictors()) 
          })
 }else{
   #classification model
@@ -100,27 +107,36 @@ if(NUM == TRUE){
   
   switch(embedding, 
          "word" = {
-           rec <- recipe(training) %>%
+           rec <- recipe(head(training)) %>%
              update_role(everything()) %>%
-             update_role(response = "outcome") %>% 
+             update_role(response, new_role = "outcome")  %>% 
              step_word(all_predictors()) %>%
              step_mutate(response = droplevels(response))
          },
          "pca" = {
-           rec <- recipe(training) %>%
+           rec <- recipe(head(training)) %>%
              update_role(everything()) %>%
-             update_role(response = "outcome") %>% 
+             update_role(response, new_role = "outcome")  %>%  
              step_cpca(all_predictors()) %>%
              step_mutate(response = droplevels(response))
          },
          "abundance" = {
-           rec <- recipe(training) %>%
+           rec <- recipe(head(training)) %>%
              update_role(everything()) %>%
-             update_role(response = "outcome") %>%
+             update_role(response, new_role = "outcome")  %>% 
              step_abundance(all_predictors()) %>%
+             step_mutate(response = droplevels(response))
+         },
+         "wordsym" = {
+           rec <- recipe(head(training)) %>%
+             update_role(everything()) %>%
+             update_role(response, new_role = "outcome")  %>% 
+             step_wordsym(all_predictors()) %>%
              step_mutate(response = droplevels(response))
          })
 }
+
+message("defined model")
 
 
 #just for reference
@@ -135,26 +151,29 @@ tune_rf <-
 rf_grid <- grid_regular(
   mtry(range = c(10, 50)),
   min_n(range = c(2, 10)),
-  levels = 2)
-
+  levels = 5)
+message("set tuning parameters")
 if(PAR == TRUE){
 ncores <- detectCores() - 1
-cl <- makeCluster(ncores)
+cl <- makeCluster(12)
 registerDoParallel()
+message(paste("registered", ncores, "cores in parallel"))
 }
-
+message("tunnning...")
 tune_results <- tune_grid(tune_rf, resamples = cv, grid = rf_grid, metrics = multi_metric, 
                 control = control_grid(save_pred = TRUE, 
                                        allow_par = TRUE, 
                                        verbose = TRUE,
                                        extract =  function (x) extract_model(x))) 
-
+message("tuning finished")
 if(PAR == TRUE){
 registerDoSEQ()
 stopCluster(cl)
+message("stopped clusters")
 }
-file <- readRDS(paste("data/rds/", filename, ".RDS", sep = ""))    
+
 ###finalize model on testing
+message("fitting final model")
 if(NUM == TRUE){
   param_final <- tune_results %>%
     select_best(metric = "rmse")
@@ -177,6 +196,9 @@ tune_results <- tune_results %>%
   mutate(.metrics2 = map(.predictions, custom_evaluate)) %>%
   mutate(.fold = gsub("Repeat|Fold", "", paste(id2, id, sep = "."))) %>%
   mutate(pr_curves = map(.predictions, custom_pr_curve)) %>%
-  mutate(roc_curves = map(.predictions, custom_roc_curve))
+  mutate(roc_curves = map(.predictions, custom_roc_curve)) %>%
+  select(-c(splits))
 }
-saveRDS(as.list(tune_results, fit), paste(filename,embedding, ".RDS", sep = ""))
+message("saving results")
+saveRDS(tune_results, paste("tuning_", filename,embedding, ".RDS", sep = ""))
+saveRDS(fit, paste(filename,embedding, ".RDS", sep = ""))
