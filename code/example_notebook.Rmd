@@ -38,7 +38,7 @@ Word embeddings can be used in microbiome analysis by recognizing the parallels 
 
 ### Environment
 
-First we set our project environment. We are using a subset of the emp qiime mapping quality controlled filtered dataset. This soil data has already been subset and split into training, testing, and setaside datasets from in a previous file that must be run separately from this notebook.  
+First we set our project environment. We are using a subset of the emp qiiime mapping quality controlled filtered dataset. This soil data has already been subset and split into training, testing, and setaside datasets from in a previous file that must be run separately from this notebook.  
 ```{r}
 #filenames
 dataFolder <- "../data"
@@ -49,8 +49,7 @@ sampleFilename <- "emp_qiime_mapping_qc_filtered.tsv"
 sampledata <- read.csv(paste(dataFolder, sampleFilename, sep = "/"), sep = "\t") %>% 
   filter(grepl("soil", Description))
 
-#read in RDS data from previous split file
-#data split code in 5_soilsubset.R
+#read in RDS data
 soil_test <- readRDS(paste(dataFolder, "soil_test.RDS", sep = "/"))
 soil_train <- readRDS(paste(dataFolder, "soil_train.RDS", sep = "/"))
 soil_setaside <- readRDS(paste(dataFolder, "soil_setaside.RDS", sep = "/"))
@@ -98,8 +97,8 @@ custom_prev_filter <- function(x,y){ #take in OTU matrix and min prevalence valu
 filtered_train <- custom_prev_filter(soil_train, prevalence)
 filtered_test <- soil_test[as.numeric(rownames(filtered_train)),] #we cannot use the prevalence function on both data sets because prevalence varies depending on the number of samples. We define prevalent bacteria with the training data set and reindex the testing data set. 
 
-#head(as_tibble(filtered_train))
-#head(as_tibble(filtered_test))
+head(filtered_train)
+head(filtered_test)
 ```
 
 ### Aggregate data by taxa level
@@ -184,7 +183,7 @@ To create word embeddings, we use the text2vec package's implementation of the G
 
 We also compare word embeddings with PCA transformed data as a baseline for dimension reduction. We write a method to use PCA learned properties with R's builtin PCA functions.
 
-```{r, eval = FALSE}
+```{r}
 #Matrix multiplication takes a lot of memory in R, but is improved by working with different object classes.
 cofxn <- function(x, sym){
   x <- as.matrix(x)  #need to convert to matrix before dgTmatrix because no method to converet dataframe to dgTMatrix 
@@ -238,7 +237,7 @@ table(sampledata[[resp]])
 
 ###### Add chosen sample data labels
 
-```{r, eval = FALSE}
+```{r}
 #reshape sample data
 sampledata2 <- sampledata %>% 
   dplyr::rename(response = !!(resp)) %>% #create a genetic response column that is the same as resp (this is because you cannot select columns with tidy function with a character object.)
@@ -267,7 +266,7 @@ Here we use the tidymodels family of function for to tune and validate our model
 #### Tuning
 
 There are some model parameters (called hyperparameters) that we can adjust independent of our dataset. Depending on the data, adjusting the value of these hyperparameters can lead to improved model prediction performance. For some of these values, we can make informed decisions to pick the most optimal value. For example, random forest models perform reasonably well with 1000 trees, and previous studies have shown few improvements in changing the number of trees. For other values, such as mtry - the number of predictors that will be randomly sampled at each tree split, and min_n - the minimum number of datapoints in a node that are required for the node to be split further, the optimum value may depend on the model data. To choose the best combination of model parameters, we run the model across a range of values and then select which ones give the best performance. We can avoid overfitting the model by tuning our model with our training dataset using a k-fold cross validation scheme before validating the model on our test set.  
-```{r, eval = FALSE}
+```{r}
 modeltype <- "randomforest"
 
 switch(modeltype, 
@@ -329,7 +328,7 @@ For word and PCA, current data can refer to independent datasets or folds of the
 
 ###### Define model "recipe" (see above)
 
-```{r, eval = FALSE}
+```{r}
 remove <- paste(substr(taxa_level,1,1), "__", sep = "")
 #model recipe and steps
 base_rec <- recipe(head(model_train)) %>%
@@ -362,7 +361,7 @@ tune_workflow <-
 
 We use K-fold cross validation to split our training data into K number of folds. We then run the model K times where in each run, K-1 folds are used as the training data and 1 fold is used as the test set. We do to this measure the variance in our model and avoid bias model predictions from overfitting to a specific set of data. After tuning our model, we can look at the best performing models based on our preferred performance metric. We then use these parameters in our final model fit. Lastly, we want to compare the results of our model predictions to a custom null model which predicts classes based on the proportion of samples in the data. 
 
-```{r,  eval = FALSE}
+```{r}
 #cross validation for training
 #we stratify samples across the sample response to make sure that each fold has an even distribution of classes.
 folds_train <- vfold_cv(model_train, v = nrepeats, strata = response)
@@ -406,7 +405,7 @@ tune_results <- tune_results %>%
 
 From the results of our tuning, we can select the best hyperparameters to make our model. We then fit our chosen model to our training data before validating it on our testing set. We bootstrap our testing set to avoid overfitting and to get a range of results to generate confidence intervals. Bootstrapping is a resampling method that generates subsets of data using random sampling with replacement.  
 
-```{r, eval = FALSE}
+```{r}
 #make final model using best parameters
 switch(modeltype, 
        "randomforest" = {
@@ -453,7 +452,7 @@ fit_results <- bootstraps_test %>%
 
 We also make predictions using a null model which is simply the probability of getting a correct classification by guessing according to the proportion of classes in the dataset. Ex: if 50% of all biomes are "forest", how well do I perform if i just guess "forest" 50% of the time?
 
-```{r, eval = FALSE}
+```{r}
 custom_nullsample <- function(x){ #custom null sample object
   train <- analysis(x)$response #take responses from training set
   test <- assessment(x)$response #take response from test set
@@ -465,12 +464,12 @@ custom_nullsample <- function(x){ #custom null sample object
 }
 #
 
-fit_results <- fit_results %>% 
+temp_results <- temp_results %>% 
   mutate(.null = future_map(splits, custom_nullsample)) %>% #create null model predictions
   select(-c("splits")) #remove splits
 
 #save tuning and testing results into single object
-final_results <- list(tune_results, fit_results)
+final_results <- list(tune_results, temp_results)
 names(final_results) <- c("tune", "test")
 #save final results as object along with model parameters as name.
 saveRDS(final_results, paste(outputFolder,"/", taxa_level,"_", resp,"_", modeltype, "_", rank, "_", embedding, ".RDS", sep = ""))

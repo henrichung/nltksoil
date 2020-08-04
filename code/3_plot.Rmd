@@ -1,3 +1,11 @@
+---
+title: "3_Plots"
+author: "Henri Chung"
+date: "7/21/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
 list.of.packages <- c("tidyverse", "parallel", "parsnip", "rsample", "yardstick", "reshape2", 
                       "dials", "tune", "furrr", "future", "workflows", "recipes", "doParallel", 
                       "text2vec", "Rcpp", "profvis","Matrix", "themis", "stringi", "data.table", 
@@ -6,20 +14,71 @@ new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"
 if(length(new.packages)) install.packages(new.packages, repos = "https://cloud.r-project.org")
 invisible(capture.output(lapply(list.of.packages, library, character.only = TRUE, warn.conflicts = FALSE, quietly = T)))
 rm(list = ls())
-source("code/nltksoil_functions.R")
-results_tune <- readRDS("data/results_tune2.RDS")
-results_validation <- readRDS("data/results_validation2.RDS")
+source("../code/nltksoil_functions.R")
+results_tune <- readRDS("../data/results_tune3.RDS")
+results_tune2 <- readRDS("../data/results_tune2.RDS")
+#results_validation <- readRDS("../data/results_validation2.RDS")
+```
 
-quantiles_95 <- function(x) {
-  r <- quantile(x, probs=c(0.05, 0.25, 0.5, 0.75, 0.95))
-  names(r) <- c("ymin", "lower", "middle", "upper", "ymax")
-  r
-}
-#read taxonomy data
-taxonomy <- read.table("data/97_otu_taxonomy.txt", fill = TRUE) %>%
-  as_tibble()
+### Background
+
+This R Markdown documents plots the results from our model workflow described in 1_model and compiled in 2_model. 
+
+##### variables
+
++ **.taxa** - (character) what taxa category is best to aggregate OTU counts? (species0, species, genus, family, order, class, phylum)
+
++ **response** - (character) envo_biome_2
+
++ **.model** - (character) which model works best? (random forest, xgboost)
+
++ **.no_components** - (numeric) for embedding methods, what length of embedding works best?
+
++ **.method** - (character) which method of transforming otu counts performs best? (base, abundance, transformpca, transformword, word, pca)
+
++ **id** - (character) what fold in the CV was used?
+
++ **.macro** - (list) macro averaged performance metrics 
+
++ **.notes** - (list) output messages from model run
+
++ **.extracts** -(list) model parameters used for that run
+
++ **.predictions** - (table) data responses (ground truth) and model predictions
+
++ **.null** - (table) data responses (ground truth) and model predictions from null model
+
++ **.macro_weight** - (list) weighted macro-averaged performance metrics
+
++ **.custom2** -  (table) table of performance metrics calculated for each class individually (All vs One)
+
++ **.null_macro_weighted** - (list) weighted macro-averaged performance metrics for null model
+
++ **.null_custom** - (table) table of performance metrics calculated for each class individually (All vs One) for null model
+
++ **model hyperparameters** - How robust/sensitive is a model to its hyperparameters for each method?
+
+
+#### Tidy Variables
+
++ **._metric** - performance metric (accuracy, f_meas, ppv)
+
++ **.estimate** - numeric value for performance metric
+
+
+### Metadata
+
+##### what do our results look like?
+
+```{r}
+head(as_tibble(results_tune))
+colnames(results_tune)
+#head(as_tibble(results_validation))
+```
+### what is the class distribution of responses?
+```{r}
 #read sample data
-sampledata <- read.csv("data/emp_qiime_mapping_qc_filtered.tsv", sep = "\t") %>% 
+sampledata <- read.csv("../data/emp_qiime_mapping_qc_filtered.tsv", sep = "\t") %>% 
   filter(grepl("soil", Description))
 
 
@@ -36,11 +95,14 @@ p0 <- sampledata %>%
   geom_text(aes(label=Freq), position=position_dodge(width=0.9), vjust=-0.25) +
   labs(title = "Response class distributions (Envo_biome_2)",
        subtitle = "soil samples only, n = 1728") +
-  ylab("OTU Count") 
+  ylab("Count") 
 p0
-ggsave(p0, filename = "outputs/p0.svg", height = 6, width = 8)
+ggsave(p0, filename = "../outputs/p0.svg", height = 6, width = 8)
+```
 
-soil_data <- readRDS("data/soil_train.RDS")
+### What is the distribution of taxa categories?
+```{r}
+soil_data <- readRDS("../data/soil_train.RDS")
 
 p1data <-  soil_data %>%
   custom_prev_filter(0.05) %>%
@@ -62,29 +124,35 @@ p1 <- p1data %>%
         axis.ticks.x=element_blank()) +
   geom_text(aes(label=Freq), position=position_dodge(width=0.9), vjust=-0.25) +
   labs(title = "Taxa Labels",
-       subtitle = "species0 = 11096") +
+       subtitle = "species = 11096 (need to adjust count from names species to OTUs)") +
   ylab("OTU Count") 
 p1
-#METHOD COMPARISON 50 COMPONENTS BALANCED ACCURACY
+ggsave(p0, filename = "../outputs/p1.svg", height = 6, width = 8)
+```
+
+### Results
+
+##### How well do models perform against each other using performance metrics? 
+
+```{r}
 p2data1 <- results_tune %>% 
   select(-c(.macro, .notes, .extracts, .custom2, .null_macro_weighted, .null_custom, .null)) %>%
-  filter(.taxa == "species" & .model == "randomforest" & .no_components == 50) %>%
+  filter(.taxa == "species" & .model == "randomforest") %>%
   unnest(.macro_weight) %>%
-  filter(.method != "word" & .method != "pca") %>%
-  filter(min_n == 1 & mtry %in% c(40, 41)) %>%
-  select(-c(min_n, mtry))
+  filter(mtry %in% c(40, 41)) %>%
+  select(-c( mtry))
 
 p2data2 <- results_tune %>% 
   select(-c(.macro, .notes, .extracts, .custom2, .null_macro_weighted, .null_custom, .null)) %>%
-  filter(.taxa == "species" & .model == "randomforest" & .no_components == 50) %>%
+  filter(.taxa == "species" & .model == "randomforest") %>%
   unnest(.macro_weight) %>%
   filter(.method == "word" | .method == "pca") %>%
   filter(mtry %in% c(40, 41)) %>%
-  select(-c(min_n, mtry))
+  select(-c( mtry))
 
 p2data3 <- results_tune %>% 
   select(-c(.macro, .notes, .extracts, .custom2, .macro_weight, .null_custom, .null)) %>%
-  filter(.taxa == "species" & .model == "randomforest" & .no_components == 50) %>%
+  filter(.taxa == "species" & .model == "randomforest") %>%
   unnest(.null_macro_weighted) %>%
   mutate(.method = "null")
 
@@ -98,19 +166,27 @@ p2 <- bind_rows(p2data1, p2data2, p2data3) %>%
   labs(title = "Comparison of methods with F1") +
   ylab("F1")
 p2
+ggsave(p2, filename = "../outputs/p2.svg", height = 6, width = 8)
 
 p2b <- bind_rows(p2data1, p2data2, p2data3) %>%
   filter(.no_components == "50") %>%
   mutate(.method = factor(.method, levels = c("base", "abundance", "transformpca", "transformword", "pca", "word", "null"))) %>%
-  filter(.metric %in% c("accuracy", "bal_accuracy", "f_meas", "kap", "npv", "precision", "recall", "specificity")) %>%
+  filter(.metric %in% c("accuracy", "bal_accuracy", "f_meas", "kap", "npv", "precision", "recall", "specificity", "pr_auc", "roc_auc")) %>%
   ggplot(aes(x = .method, y = .estimate, fill = .method )) + 
   geom_boxplot() +
   theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
-  facet_wrap(~.metric, scales = "free") + 
+  facet_wrap(~.metric) + 
   labs(title = "Comparison of methods with all metrics") +
   ylab("value of metric")
 p2b
 
+ggsave(p2b, filename = "../outputs/p2b.svg", height = 6, width = 8)
+```
+### How well do models perform against each other using performance PR and ROC curves?
+
+no PR or ROC curves for null model because there are no threshold values.
+
+```{r}
 p3data1 <- results_tune %>%
   select(-c(.macro, .notes, .extracts, .custom2, .null_macro_weighted, .null_custom, .null)) %>%
   filter(.taxa == "species" & .model == "randomforest" & .no_components == 50) %>%
@@ -132,11 +208,13 @@ p3 <- bind_rows(p3data1, p3data2) %>%
   geom_path() +
   coord_equal() +
   facet_grid(.level~.method) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
   theme_bw() +
   labs(title = "Precision Recall Curve Comparison by Method and Class", 
        subtitle = "All vs One")
 p3
-
+ggsave(p3, filename = "../outputs/p3.svg", height = 6, width = 8)
+#
 p3bdata1 <- results_tune %>%
   select(-c(.macro, .notes, .extracts, .custom2, .null_macro_weighted, .null_custom, .null)) %>%
   filter(.taxa == "species" & .model == "randomforest" & .no_components == 50) %>%
@@ -159,37 +237,48 @@ p3b <- bind_rows(p3bdata1, p3bdata2) %>%
   geom_abline(lty = 3) +
   coord_equal() +
   facet_grid(.level~.method) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
   theme_bw() +
   labs(title = "Receiver Operating Characteristic Curve Comparison by Method and Class", 
        subtitle = "All vs One")
 p3b
-
-
+ggsave(p3b, filename = "../outputs/p3b.svg", height = 6, width = 8)
+```
+### How does the length of embeddings affect performance metrics?
+```{r}
 p4 <-  results_tune %>%
   select(-c(.macro, .notes, .extracts, .custom2, .null_macro_weighted, .null_custom, .null)) %>%
   filter(.taxa == "species" & .model == "randomforest") %>% 
   filter(.method == "transformword" | .method == "transformpca") %>%
-  mutate(.macro_weight = map(.macro_weight, ~filter(., min_n == 1 & mtry %in% c(40, 41)))) %>%
+  mutate(.macro_weight = map(.macro_weight, ~filter(., mtry %in% c(40, 41)))) %>%
   unnest(.macro_weight) %>%
   filter(.metric == "f_meas") %>%
   ggplot(aes(x = .no_components, y = .estimate, fill = .method)) +
   geom_boxplot() +
-  labs(title = "Effect of embedding length on F1 Score") +
+  labs(title = "Effect of embedding length on F1") +
   xlab("F1")
 p4
+ggsave(p4, filename = "../outputs/p4.svg", height = 6, width = 8)
+
 p4b <-  results_tune %>%
   select(-c(.macro, .notes, .extracts, .custom2, .null_macro_weighted, .null_custom, .null)) %>%
   filter(.taxa == "species" & .model == "randomforest") %>% 
   filter(.method == "transformword" | .method == "transformpca") %>%
-  mutate(.macro_weight = map(.macro_weight, ~filter(., min_n == 1 & mtry %in% c(40, 41)))) %>%
+  mutate(.macro_weight = map(.macro_weight, ~filter(.,mtry %in% c(40, 41)))) %>%
   unnest(.macro_weight) %>%
   filter(.metric %in% c("accuracy", "bal_accuracy", "f_meas", "kap", "npv", "precision", "recall", "specificity")) %>%
   ggplot(aes(x = .no_components, y = .estimate, fill = .method)) +
   geom_boxplot() +
   facet_wrap(~.metric) +
-  labs(title = "Effect of embedding length on all metrics")
+  labs(title = "Effect of embedding length on all metrics") +
+  ylab("value")
 p4b
+ggsave(p4b, filename = "../outputs/p4b.svg", height = 6, width = 8)
+```
 
+### How does the length of embedding affect PR and ROC curves?
+
+```{r}
 p5data <- results_tune %>%
   select(-c(.macro, .notes, .extracts, .custom2, .null_macro_weighted, .null_custom, .null)) %>%
   filter(.taxa == "species" & .model == "randomforest")  %>%
@@ -204,8 +293,9 @@ p5 <- p5data  %>%
   geom_path() +
   coord_equal() +
   facet_grid(.level~.no_components) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
   theme_bw() +
-  labs(title = "Precision Recall Curve Comparison by Method and No_components for transformword", 
+  labs(title = "Precision Recall Curve Comparison by Class and No_components for transformword", 
        subtitle = "All vs One")
 p5
 ggsave(p5, filename = "../outputs/p5.svg", height = 6, width = 8)
@@ -216,8 +306,9 @@ p5b <- p5data  %>%
   geom_path() +
   coord_equal() +
   facet_grid(.level~.no_components) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
   theme_bw() +
-  labs(title = "Precision Recall Curve Comparison by Method and No_components for transformpca", 
+  labs(title = "Precision Recall Curve Comparison by Class and No_components for transformpca", 
        subtitle = "All vs One")
 p5b
 ggsave(p5b, filename = "../outputs/p5b.svg", height = 6, width = 8)
@@ -239,8 +330,9 @@ p6 <- p6data  %>%
   geom_abline(lty = 3) +
   coord_equal() +
   facet_grid(.level~.no_components) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
   theme_bw() +
-  labs(title = "Receiver Operating Characteristic Curve Comparison by Method and Class for transformword", 
+  labs(title = "Receiver Operating Characteristic Curve Comparison by Class and No_components for transformword", 
        subtitle = "All vs One")
 p6
 ggsave(p6, filename = "../outputs/p6.svg", height = 6, width = 8)
@@ -252,18 +344,23 @@ p6b <- p6data  %>%
   geom_abline(lty = 3) +
   coord_equal() +
   facet_grid(.level~.no_components) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
   theme_bw() +
-  labs(title = "Receiver Operating Characteristic Curve Comparison by Method and Class for transformword", 
+  labs(title = "Receiver Operating Characteristic Curve Comparison by Class and No_components for transformword", 
        subtitle = "All vs One")
 p6b
 ggsave(p6b, filename = "../outputs/p6b.svg", height = 6, width = 8)
 
+```
 
+### How does Taxa aggregation affect performance metrics?
+
+```{r}
 p7data <- results_tune %>%
   select(-c(.macro, .notes, .extracts, .custom2, .null_macro_weighted, .null_custom, .null)) %>%
   filter(.no_components == 50) %>%
   filter(.method == "base" | .method == "abundance") %>%
-  mutate(.macro_weight = map(.macro_weight, ~filter(., min_n == 1 & mtry %in% c(40, 41)))) %>%
+  mutate(.macro_weight = map(.macro_weight, ~filter(., mtry %in% c(40, 41)))) %>%
   unnest(.macro_weight) %>%
   filter(.metric %in% c("accuracy", "bal_accuracy", "f_meas", "kap", "npv", "precision", "recall", "specificity")) 
 p7 <- p7data %>%
@@ -282,12 +379,14 @@ p7b <- p7data  %>%
   geom_boxplot() +
   facet_wrap(~.metric) +
   labs(title = "Effect of embedding length on all metrics") +
-  ylab("F1 Score") +
+  ylab("value") +
   theme(axis.text.x = element_text(angle = 90, hjust = 1))
 p7b
 ggsave(p7b, filename = "../outputs/p7.svg", height = 6, width = 8)
+```
+### How does Taxa aggregation affect PR and ROC curves?
 
-
+```{r}
 p8data <- results_tune %>%
   select(-c(.macro, .notes, .extracts, .custom2, .null_macro_weighted, .null_custom, .null)) %>%
   filter(.no_components == 50) %>%
@@ -302,6 +401,7 @@ p8 <- p8data  %>%
   geom_path() +
   coord_equal() +
   facet_grid(.level~.taxa) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
   theme_bw() +
   labs(title = "Precision Recall Curve Comparison by class and taxa for base", 
        subtitle = "All vs One")
@@ -314,11 +414,12 @@ p8b <- p8data  %>%
   geom_path() +
   coord_equal() +
   facet_grid(.level~.taxa) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
   theme_bw() +
   labs(title = "Precision Recall Curve Comparison by class and taxa for abundance", 
        subtitle = "All vs One")
 p8b
-ggsave(p8n, filename = "../outputs/p8n.svg", height = 6, width = 8)
+ggsave(p8b, filename = "../outputs/p8n.svg", height = 6, width = 8)
 
 p9data <-  results_tune %>%
   select(-c(.macro, .notes, .extracts, .custom2, .null_macro_weighted, .null_custom, .null)) %>%
@@ -336,13 +437,14 @@ p9 <- p9data  %>%
   geom_abline(lty = 3) +
   coord_equal() +
   facet_grid(.level~.taxa) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
   theme_bw() +
   labs(title = "Receiver Operating Characteristic Curve Comparison by class and taxa for abundance",
        subtitle = "All vs One")
 p6
 ggsave(p9, filename = "../outputs/p9.svg", height = 6, width = 8)
 
-p9b <- p6data  %>%
+p9b <- p9data  %>%
   filter(.method == "abundance") %>%
   ggplot(aes(x = 1 - specificity, y = sensitivity, group = id, color = .taxa)) +
   geom_path() +
@@ -350,95 +452,136 @@ p9b <- p6data  %>%
   coord_equal() +
   facet_grid(.level~.taxa) +
   theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
   labs(title = "Receiver Operating Characteristic Curve Comparison by class and taxa for abundance",
        subtitle = "All vs One")
 p9b
 ggsave(p9b, filename = "../outputs/p9b.svg", height = 6, width = 8)
 
-##############################
-
-p1b <- results_tune %>% 
+```
+### How sensitive are models to hyperparameters?
+```{r}
+p10 <- results_tune2 %>%
+  select(-c(.macro, .custom2, .null_macro_weighted, .null_custom, .null)) %>%
   filter(.taxa == "species" & .model == "randomforest") %>%
-  unnest(.extracts) %>% unnest(.extracts) %>%
-  filter(.no_components == "50") %>%
-  ggplot(aes(x = as.factor(min_n), y = .extracts, fill = .method )) + 
-  geom_boxplot() + 
-  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
-  facet_wrap(~.method)
-p1b
+  filter(.method != "pca" & .method != "word") %>%
+  filter(.no_components == 50) %>%
+  unnest(.macro_weight) %>%
+  filter(.metric == "f_meas") %>%
+  ggplot(aes(x = as.factor(mtry), y = as.factor(min_n), fill = .estimate)) + 
+  geom_tile() + 
+  facet_wrap(~.method, scales = "free") +
+  labs(title = "Change in F1 Scores from hyperparameter tuning by method") +
+  xlab("mtry") + ylab("min_n")
+p10
+ggsave(p10, filename = "../outputs/p10.svg", height = 6, width = 8)
 
-p2 <- results_tune %>% 
+p10b <- results_tune2 %>%
+  select(-c(.macro, .custom2, .null_macro_weighted, .null_custom, .null)) %>%
   filter(.taxa == "species" & .model == "randomforest") %>%
-  unnest(.metrics) %>%
+  filter(.method == "transformword" | .method == "transformpca") %>%
+  unnest(.macro_weight) %>%
+  filter(.metric == "f_meas") %>%
+  ggplot(aes(x = as.factor(mtry), y = as.factor(min_n), fill = .estimate)) + 
+  geom_tile() + 
+  facet_grid(.no_components~.method, scales = "free") +
+  labs(title = "Change in F1 Scores from hyperparameter tuning by method and .no_components",
+       subtitle = "only transformpca and transformword") +
+  xlab("mtry") + ylab("min_n")
+p10b
+ggsave(p10b, filename = "../outputs/p10b.svg", height = 6, width = 8)
+```
+### What if we repeated every previous figure but it was using xgboost instead of a randomforest model?
+
+#### How does xgboost vary with hyperparameters?
+```{r, eval}
+x1data <- results_tune2 %>%
+  select(-c(.macro, .custom2, .null_macro_weighted, .null_custom, .null)) %>%
+  filter(.taxa == "species" & .model == "xgboost") %>%
+  filter(.method != "pca" & .method != "word") %>%
+  filter(.no_components == 50) %>%
+  unnest(.macro_weight) 
+x1 <- x1data %>%
+  filter(.metric == "f_meas") %>%
+  pivot_longer(cols = c("tree_depth", "min_n", "loss_reduction", "sample_size", "mtry", "learn_rate"), names_to = ".hyperparameters", values_to = ".hp_estimate") %>%
+  ggplot(aes(x = as.factor(.hp_estimate), y = .estimate, fill = .method)) + 
+  geom_boxplot(position = "dodge") + 
+  facet_grid(.method~.hyperparameters, scales = "free") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Change in F1 Scores from xgboost hyperparameter tuning by method")
+x1
+ggsave(x1, filename = "../outputs/x1.svg", height = 6, width = 8)
+```
+```{r, eval = FALSE}
+x1b <- x1data %>%
+  filter(.method == "transformword") %>%
+  pivot_longer(cols = c("tree_depth", "min_n", "loss_reduction", "sample_size", "mtry", "learn_rate"), names_to = ".hyperparameters", values_to = ".hp_estimate") %>%
+  ggplot(aes(x = as.factor(.hp_estimate), y = .estimate, fill = .method)) + 
+  geom_boxplot(position = "dodge") + 
+  facet_grid(.metric~.hyperparameters, scales = "free") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Change in all metrics from xgboost hyperparameter tuning by method for transformword")
+x1b
+ggsave(x1b, filename = "../outputs/x1b.svg", height = 6, width = 8)
+
+x1c <- x1data %>%
+  filter(.method == "transformpca") %>%
+  pivot_longer(cols = c("tree_depth", "min_n", "loss_reduction", "sample_size", "mtry", "learn_rate"), names_to = ".hyperparameters", values_to = ".hp_estimate") %>%
+  ggplot(aes(x = as.factor(.hp_estimate), y = .estimate, fill = .method)) + 
+  geom_boxplot(position = "dodge") + 
+  facet_grid(.metric~.hyperparameters, scales = "free") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Change in all metrics from xgboost hyperparameter tuning by method for transformpca")
+x1c
+ggsave(x1c, filename = "../outputs/x1c.svg", height = 6, width = 8)
+```
+
+
+### Validation Set
+
+Repeat all graphs on validation set
+
+Messed up validation results (these are incorrect)
+
+```{r}
+
+results_validation <- readRDS("../data/results_validation2.RDS")
+p40data1 <- results_validation %>% 
+  select(-c(.macro, .custom2, .null_macro_weighted, .null_custom, .null)) %>%
+  filter(.taxa == "species" & .model == "randomforest") %>%
+  unnest(.macro_weight) 
+
+p40data2 <- results_validation %>% 
+  select(-c(.macro, .custom2, .macro_weight, .null_custom, .null)) %>%
+  filter(.taxa == "species" & .model == "randomforest") %>%
+  unnest(.null_macro_weighted) %>%
+  mutate(.method = "null")
+
+
+p40 <- bind_rows(p40data1, p40data2) %>% 
   filter(.metric == "f_meas") %>%
   filter(.no_components == "50") %>%
-  ggplot(aes(x = as.factor(try), y = .estimate, fill = .method )) + 
-  geom_boxplot() + 
-  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
-  facet_wrap(~.method)
-p2
-
-p2b <- results_tune %>% 
-  filter(.taxa == "species" & .model == "randomforest") %>%
-  unnest(.extracts) %>% unnest(.extracts) %>%
-  filter(.no_components == "50") %>%
-  ggplot(aes(x = as.factor(mtry), y = .extracts, fill = .method )) + 
-  geom_boxplot() + 
-  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
-  facet_wrap(~.method)
-p2b
-
-p3 <- results_tune %>% 
-  filter(.taxa == "species" & .model == "randomforest") %>%
-  unnest(.metrics) %>%
-  filter(.metric == "f_meas") %>%
-  filter(.no_components == "50") %>%
+  mutate(.method = factor(.method, levels = c("base", "abundance", "transformpca", "transformword", "pca", "word", "null"))) %>%
   ggplot(aes(x = .method, y = .estimate, fill = .method )) + 
   geom_boxplot() +
-  theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
-p3
-
-p4 <- results_tune %>%
-  filter(.method == "base" | .method == "abundance") %>%
-  filter(.model == "randomforest") %>%
-  filter(.no_components == "50") %>%
-  unnest(.metrics) %>%
-  filter(.metric == "f_meas") %>%
-  ggplot(aes(x = .taxa, y = .estimate, fill = .method)) +
-  geom_boxplot() + 
-  theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
-p4
-
-p5 <- results_tune %>%
-  filter(.method == "transformword" | .method == "transformpca") %>%
-  filter(.model == "randomforest") %>%
-  unnest(.metrics) %>%
-  filter(.metric == "f_meas") %>%
-  ggplot(aes(x = .no_components, y = .estimate, fill = .method)) + 
-  geom_boxplot() + 
   theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
-  facet_wrap(~.method)
-p5
+  labs(title = "Comparison of methods with F1") +
+  ylab("F1")
+p40
+ggsave(p40, filename = "../outputs/p40.svg", height = 6, width = 8)
 
-p5b <- results_tune %>%
-  filter(.method == "transformword" | .method == "transformpca") %>%
-  filter(.model == "randomforest") %>%
-  unnest(.extracts) %>% unnest(.extracts) %>%
-  ggplot(aes(x = .no_components, y = .extracts, fill = .method)) + 
-  geom_boxplot() + 
-  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
-  facet_wrap(~.method)
-p5b
-
-x1 <- results_tune %>% 
-  filter(.taxa == "species" & .model == "xgboost") %>%
-  unnest(.metrics) %>%
-  filter(.metric == "f_meas") %>%
+p40b <- bind_rows(p40data1, p40data2) %>%
   filter(.no_components == "50") %>%
-  ggplot(aes(x = as.factor(min_n), y = .estimate, fill = .method )) + 
-  geom_boxplot() + 
-  #theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
-  facet_wrap(~.method)
-x1
+  mutate(.method = factor(.method, levels = c("base", "abundance", "transformpca", "transformword", "pca", "word", "null"))) %>%
+  filter(.metric %in% c("accuracy", "bal_accuracy", "f_meas", "kap", "npv", "precision", "recall", "specificity")) %>%
+  ggplot(aes(x = .method, y = .estimate, fill = .method )) + 
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  facet_wrap(~.metric, scales = "free") + 
+  labs(title = "Comparison of methods with all metrics") +
+  ylab("value of metric")
+p40b
 
-test <- head(results_tune) %>% unnest(.predictions)
+ggsave(p40b, filename = "../outputs/p40b.svg", height = 6, width = 8)
+```
+
