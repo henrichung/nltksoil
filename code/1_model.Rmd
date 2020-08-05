@@ -8,17 +8,15 @@ output: html_document
 ```{r setup, include=FALSE}
 ## Section A: Set up libraries and load data
 ##################################################
-list.of.packages <- c("tidyverse", "parallel", "parsnip", "rsample", "yardstick", "reshape2", 
-                      "dials", "tune", "furrr", "future", "workflows", "recipes", "doParallel", 
-                      "text2vec", "Rcpp", "profvis","Matrix", "themis", "stringi", "data.table", 
-                      "tictoc", "ranger")
+list.of.packages <- c("tidyverse","tidymodels",  "reshape2", "furrr", "future", "doParallel", 
+                      "text2vec", "stringi")#, "Rcpp", "profvis","Matrix", "themis", "stringi", "data.table", "tictoc")
 new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
 if(length(new.packages)) install.packages(new.packages, repos = "https://cloud.r-project.org")
 invisible(capture.output(lapply(list.of.packages, library, character.only = TRUE, warn.conflicts = FALSE, quietly = T)))
 
 rm(list = ls()) #clear environment
 args <- commandArgs(trailingOnly = TRUE)
-source("nltksoil_functions.R") #Load functions
+source("code/nltksoil_functions.R") #Load functions
 ```
 
 ### Background
@@ -36,42 +34,48 @@ Word embeddings can be used in microbiome analysis by recognizing the parallels 
 
 ### Workflow
 
+This workflow uses a combination of "tidyverse" and "tidymodel" family packages for model training and analysis. These are a collection of packages designed to follow "tidy" data management principles and to work seemlessly together. Details of "tidy" package design can be read here (https://tidyverse.tidyverse.org/articles/manifesto.html)
+
 ### Environment
 
 First we set our project environment. We are using a subset of the emp qiime mapping quality controlled filtered dataset. This soil data has already been subset and split into training, testing, and setaside datasets from in a previous file that must be run separately from this notebook.  
 ```{r}
-#filenames
-dataFolder <- "../data"
-outputFolder <- "../outputs"
+dataFolder <- "data"
+outputFolder <- "../../../../work/idoerg/hchung/outputs/soil"
 sampleFilename <- "emp_qiime_mapping_qc_filtered.tsv"
 
 #read sample data
 sampledata <- read.csv(paste(dataFolder, sampleFilename, sep = "/"), sep = "\t") %>% 
   filter(grepl("soil", Description))
 
-#read in RDS data from previous split file
-#data split code in 5_soilsubset.R
-soil_test <- readRDS(paste(dataFolder, "soil_test.RDS", sep = "/"))
-soil_train <- readRDS(paste(dataFolder, "soil_train.RDS", sep = "/"))
-soil_setaside <- readRDS(paste(dataFolder, "soil_setaside.RDS", sep = "/"))
-
+#read in RDS data
+dataFolder <- "../../../../work/idoerg/hchung/"
+otu_id <- readRDS(paste(dataFolder, "emp_deblur_90bp.qc_filtered_otu_taxonomy_list.RDS", sep = "/"))
+soil_split <- readRDS(paste(dataFolder, "soil_split.RDS", sep = "/"))
+soil_train <- training(soil_split)
+soil_test <- testing(soil_split)
 ```
 ### Set model parameters
 
 In this section we define some of our model parameters to be used later in the workflow
 ```{r}
 #model Parameters
-nrepeats <- 3 #define the number of folds to use during cross-validation
-prevalence <- 0.05 #define the minimum percent prevalence to filter data
-PAR = FALSE #We speed up our model runs on each fold by parallizing across multiple cores.
-ncores <- 36 #Set the number of cores to use here
+nrepeats <- 10 #define the number of folds to use during cross-validation
+PAR = TRUE #We speed up our model runs on each fold by parallizing across multiple cores.
+ncores <- 10 #Set the number of cores to use here
 
 #tuning parameters
 #set number of parameters to test for each model
-rf_search_levels = 2
-xgb_search_levels = 3
-#iterations
+rf_search_levels = 20
+xgb_search_levels = 30
 
+#iterations
+#model variables to iterate over
+resp <- "envo_biome_2" #response variable to predict
+taxa_level = "phylum" #taxa level to aggregate OTUs to
+modeltype = "randomforest" #model to make predictions (xgboost)
+rank = 50 #rank/ no components for wmbedding space (any numeric value)
+embedding = "base" #what embedding method to use (base, abundance, transformword, transformpca)
 
 #set up parallel processing
 if(PAR){
@@ -79,103 +83,7 @@ if(PAR){
   registerDoParallel(cl)
   message(Sys.time()," REGISTERED ", ncores, " CORES")
 }
-```
 
-### Filter by prevalence
-
-We filter our dataset to remove any taxa that rarely occur amongst the samples. This improves the generalizability of our model since we do not use overly specific taxa that only occur in a few of the samples. Filtering also helps remove excess noise by removing OTU counts that come from sequencing or OTU-clustering errors. 
-
-```{r}
-#define prevalence function
-custom_prev_filter <- function(x,y){ #take in OTU matrix and min prevalence value
-  bin <- x > 0 #convert abundance dataframe into binary presence 
-  index <- Matrix::rowSums(bin)/(ncol(bin)-1) #calculate percent prevalence for each OTU
-  index <- index > y #get index of values above y
-  res <- x[index,] #return matrix with only those entires
-  return(res)
-}
-
-filtered_train <- custom_prev_filter(soil_train, prevalence)
-filtered_test <- soil_test[as.numeric(rownames(filtered_train)),] #we cannot use the prevalence function on both data sets because prevalence varies depending on the number of samples. We define prevalent bacteria with the training data set and reindex the testing data set. 
-
-#head(as_tibble(filtered_train))
-#head(as_tibble(filtered_test))
-```
-
-### Aggregate data by taxa level
-
-We want to compare word embeddings methods against other forms of dimension reduction such as OTU aggregation by taxa. Aggregating by taxa means collapsing individual OTU counts to summed counts over a higher taxonomic category such as genus or family. This also helps remove possible errors from OTU clustering where sequences slightly below or above the percent similarity threshold are inaccurately labeled. For species, we define separate cases for when OTUs in the dataset have distinct species annotations ("species") and when OTUs are known to be separate but are unannotated (species0). The "species0" option is equivalent to not aggregating by any of the taxonomy labels. 
-```{r, warnings = FALSE}
-#define custom function takes in a filtered dataframe and a taxa level
-custom_summarize_taxa <- function(x, y){
-  if(y != "species0"){ 
-      z = y
-      remove <- paste(substr(y,1,1), "__", sep = "") #remove "$__" labels from OTU annotations
-        taxa <- c("kingdom", "phylum", "class", "order", "family", "genus", "species") #create list of all taxonomy categories
-        taxa <- stri_remove_empty(str_remove(taxa, z)) #remove all except chosen taxa
-
-      res <- x %>% #separate composite taxonomy information into separate columns
-        separate(taxonomy, c("kingdom", "phylum", "class", "order", "family", "genus", "species"), sep = "; ") %>%
-        select(-c(all_of(taxa))) %>% #select appropriate column
-        drop_na(!!y) #drop empty values
-
-      #We save time on this step by using functions from "data.table", which is significantly faster than tidyverse tibbles.
-      res <- data.table::setDT(res)[, lapply(.SD, sum, na.rm = TRUE), by = y] #aggregate by unique taxa category
-
-      res <- res %>%
-        mutate_(taxonomy = y) %>% #rename taxonomy column to selected taxa
-        mutate(taxonomy = gsub(remove, "", taxonomy)) %>% #remove $___ label
-        filter(taxonomy != "") #remove blank labels
-    }else{ #using species0 is the equivalent to not aggregating by any taxa labels.
-      z = "species"
-      remove <- paste(substr(y,1,1), "__", sep = "")
-        taxa <- c("kingdom", "phylum", "class", "order", "family", "genus", "species")
-        taxa <- stri_remove_empty(str_remove(taxa, z))
-  
-      res <- x %>%
-        separate(taxonomy, c("kingdom", "phylum", "class", "order", "family", "genus", "species"), sep = "; ") %>%
-        select(-c(all_of(taxa)))
-
-      res <- res %>%
-        mutate_(taxonomy = z) %>%
-        mutate(taxonomy = gsub(remove, "", taxonomy)) %>%
-        mutate(species = paste("s__", 1:nrow(res), sep = ""))
-    }
-    return(res)
-}
-#For this example, we will aggregate over "species" which is functionall the same as simply not aggregating at all.
-taxa_level <- "species0"
-summarized_train <- custom_summarize_taxa(filtered_train, taxa_level)
-summarized_test <- custom_summarize_taxa(filtered_test, taxa_level)
-
-#expect the output after running these commands, these warnings do not affect the results
-#Expected 7 pieces. Missing pieces filled with `NA` in 3494 rows [8, 10, 18, 22, 23, 24, 29, 32, 38, 42, 45, 46, 56, 72, 74, 91, 95, 100, 101, 105, ...].`mutate_()` is deprecated as of dplyr 0.7.0.
-#Please use `mutate()` instead.
-#See vignette('programming') for more help
-#This warning is displayed once every 8 hours.
-#Call `lifecycle::last_warnings()` to see where this warning was generated.Expected 7 pieces. Missing pieces filled with `NA` in 3494 rows [8, 10, 18, 22, 23, 24, 29, 32, 38, 42, 45, 46, 56, 72, 74, 91, 95, 100, 101, 105, ...].
-```
-
-### Reshape Data
-
-Because we are using tidyverse functions, we have to reshape our dataset to follow tidyverse principles. Tidyverse principles include ensuring that (amongst other requirements), each variable (taxa) forms a column, each observation (sample) forms a row, and that dataframes do not have rownames (pedantic).  Practically, it means we have to transpose our data while retaining the correct labeling of our variables and samples.
-```{r}
-#reshape data function; Remove taxonomy, make rownames as SampleID
-custom_reshape <- function(x){
-  rownames(x) = NULL #make sure all rownames are null
-  res <- x %>%
-    select(-c("taxonomy")) %>% #remove taxonomy column
-    column_to_rownames(taxa_level) %>% #convert to rownames
-    t() %>%
-    as.data.frame() %>%
-    rownames_to_column("X.SampleID")
-  return(res)
-}
-if(taxa_level == "species0"){taxa_level = "species"}
-##section here for change relative abundance
-message(Sys.time()," RESHAPING DATA")
-reshaped_train <- custom_reshape(summarized_train)
-reshaped_test <- custom_reshape(summarized_test)
 ```
 
 ### Dimension Reduction
@@ -184,11 +92,12 @@ To create word embeddings, we use the text2vec package's implementation of the G
 
 We also compare word embeddings with PCA transformed data as a baseline for dimension reduction. We write a method to use PCA learned properties with R's builtin PCA functions.
 
-```{r, eval = FALSE}
-#Matrix multiplication takes a lot of memory in R, but is improved by working with different object classes.
+
+```{r}
+#function to create co-occurence matrix from a table (samples rows, terms columns)
 cofxn <- function(x, sym){
-  x <- as.matrix(x)  #need to convert to matrix before dgTmatrix because no method to converet dataframe to dgTMatrix 
-  x <- as(x, "dgTMatrix") #convert to dense triplet sparse matrix
+  x <- data.matrix(x)
+  x <- as(x, "dgTMatrix")
   y <- x > 0
     if(sym){
       z <- Matrix::crossprod(y)
@@ -198,78 +107,104 @@ cofxn <- function(x, sym){
   return(z)
 }
 
-#We define a custom word embedding function to create word embeddings for each variable
-create_word_embedding <- function(input, sym = FALSE, rank = 50, remove = "s__"){
+#function to create GloVe word embeddings
+create_word_embedding <- function(input, sym = FALSE, rank = 50){
   cooccur_table <- cofxn((input), sym)
   glove = GlobalVectors$new(rank = rank, x_max = 1, learning_rate = 0.1) #hyperparameters
   wv_main = glove$fit_transform(cooccur_table, n_iter = 10, convergence_tol = 0.1, n_threads = 1)
   wv_context = glove$components
   word_vectors = wv_main + t(wv_context)
-  colnames(word_vectors) <- paste(remove, 1:ncol(word_vectors), sep = "")
   return(word_vectors)
 }
 
-
-create_pca_embedding <- function(x_, rank = 50, remove = "s__"){
-  #temp_name <- paste(substr(colnames(x_)[1],1,1), "__", sep = "")
-  x_ <- (as.matrix(x_))
+#function to create principal components
+create_pca_embedding <- function(x_, rank = 50){
+  x_ <- data.matrix(x_)
   pca_ <- prcomp(x_,rank = rank, center=TRUE)$rotation
-  colnames(pca_) <- paste(remove, 1:ncol(pca_), sep = "")
   return(pca_)
 }
 
-rank <- 50
-remove <- paste(substr(taxa_level,1,1), "__", sep = "")
-pca_matrix <- create_pca_embedding(reshaped_train[,-1], rank = rank, remove = remove)
-word_matrix <- try(create_word_embedding(reshaped_train[,-1], rank = rank, remove = remove), silent = TRUE)
-```
-##### Label data
-
-Here we label our samples by our variable of interest. These labels are the responses we are trying to predict from our machine learning model. We are specifically interested in multiclass environmental variables. There are multiple variables of interest avilable in the dataset.
-```{r}
-#Column names of sample data, what variables could we try to use as our response?
-colnames(sampledata)
-resp = "envo_biome_2"
-
-#Check class distribution of response data
-table(sampledata[[resp]])
+otu_train <- select(soil_train, -contains("metadata")) #select OTU volumns from dataset 
+pca_matrix <- create_pca_embedding(otu_train, rank = rank)
+word_matrix <- create_word_embedding(otu_train, rank = rank)
 
 ```
 
-###### Add chosen sample data labels
+### Aggregate data by taxa level
 
-```{r, eval = FALSE}
-#reshape sample data
-sampledata2 <- sampledata %>% 
-  dplyr::rename(response = !!(resp)) %>% #create a genetic response column that is the same as resp (this is because you cannot select columns with tidy function with a character object.)
-  select(c("X.SampleID", "response"))  #select response and SampleID column
+We want to compare word embeddings methods against other forms of dimension reduction such as OTU aggregation by taxa. Aggregating by taxa means collapsing individual OTU counts to summed counts over a higher taxonomic category such as genus or family. This also helps remove possible errors from OTU clustering where sequences slightly below or above the percent similarity threshold are inaccurately labeled. For species, we define separate cases for when OTUs in the dataset have distinct species annotations ("species") and when OTUs are known to be separate but are unannotated (otu). The "otu" option is equivalent to not aggregating by any of the taxonomy labels. 
 
-custom_add_sampledata <- function(x, samp, min){ #function takes in tidy data, the sampledata, and a min response variable
-  res <- x %>%
-    left_join(samp, by = "X.SampleID") %>% #join sampledata by ID
-    dplyr::select(-c("X.SampleID")) %>% #remove ID column
-    group_by(response) %>% #group by response factors for filter
-    filter(n() > min) %>% #filter out labels that are less than the minimum number of responses
-    ungroup() %>%  #ungroup after filtering
-    filter(response != "") %>% #remove blanks
-    drop_na(response) %>% #remove NA
-    mutate(response = droplevels(response)) #Drop missing factors
+```{r, warnings = FALSE}
+custom_summarize_taxa <- function(input, taxa_level, otu_key){
+  temp <- as.data.frame(t(input)) %>%
+    rownames_to_column("otuid") %>%
+    left_join(otu_key, by = "otuid") 
+
+  taxa <- stri_remove_empty(str_remove(c("kingdom", "phylum", "class", "order", "family", "genus", "species", "otu"), taxa_level)) #remove all except chosen taxa
+
+  suppressWarnings(
+  res <- temp %>% #separate composite taxonomy information into separate columns
+    separate(taxonomy, c("kingdom", "phylum", "class", "order", "family", "genus", "species"), extra = "drop", sep = "; ") %>%
+    rename(otu = "otuid") %>% 
+    select(-c(all_of(taxa))) %>%
+    drop_na(!!taxa_level) 
+  )
+
+  #We save time on this step by using functions from "data.table", which is significantly faster than tidyverse tibbles.
+  res <- data.table::setDT(res)[, lapply(.SD, as.numeric), by=taxa_level]
+  res <- data.table::setDT(res)[, lapply(.SD, sum, na.rm = TRUE), by = taxa_level] #aggregate by unique taxa category
+
+  remove <- paste(substr(taxa_level,1,1), "__", sep = "") #remove "$__" labels from OTU annotations
+  
+  res <- res %>%
+    rename(taxonomy = all_of(taxa_level)) %>% #rename taxonomy column to selected taxa
+    filter(taxonomy != remove) %>% #remove blank labels
+    column_to_rownames("taxonomy") %>%
+    t() %>% 
+    as.data.frame() %>%
+    janitor::clean_names()  
+
   return(res)
 }
-#add sample data
-model_train <- custom_add_sampledata(reshaped_train, samp =  sampledata2, min = 0)
-model_test <- custom_add_sampledata(reshaped_test, samp = sampledata2, min = 0)
 ```
+
+### Model Recipe
+
+The recipes package ise used to create design matrices for modeling and to conduct preprocessing of variables. It is meant to be a more extensive framework that R's formula method. Some differences between simple formula methods and recipes are that
+
++ Variables can have arbitrary roles in the analysis beyond predictors and outcomes.
+
++ A recipe consists of one or more steps that define actions on the variables.
+
++ Recipes can be defined sequentially using pipes as well as being modifiable and extensible.
+
+The recipes package follows "tidy" design principles and is designed to work with other tidyverse packages in a model workflow. 
+
+```{r}
+#select response variable to predict
+response = paste("metadata", resp, sep = "__")
+
+#define recipe
+base_rec <- recipe(head(soil_train)) %>%
+  update_role(contains("metadata"), new_role = "id") %>% #columns with metadata are id variables
+  update_role(-contains("metadata"), new_role = "predictor") %>% #columns that don't contain metadata labels are predictors (OTU columns)
+  update_role(matches(response), new_role = "outcome") %>% #response variable is defined as outcome variable
+  step_naomit(all_outcomes(), skip = TRUE) %>% #remove NAs in response variable
+  step_factor2string(all_outcomes(), skip = TRUE) %>% #converting strings to and from factors remove dropped factor levels
+  step_string2factor(all_outcomes(), skip = TRUE) %>% 
+  step_aggregate(all_predictors(), options = list("taxa_level" = taxa_level, "otu_key" = otu_id, names = TRUE)) #calls the custom summarize function
+
+```
+
 ### Machine Learning
 
-Here we use the tidymodels family of function for to tune and validate our model. Tidymodels follow a specific model running workflow that allows for quick deployment of models across multiple datasets (or subsets of datasets). A brief description involves defining the apropriate model, defining a number of "steps" to perform on each new dataset, and then running the steps and model (together called a "workflow") to multiple datasets (possibly in parallel). There are several models that can be used such as random forest, xgboost, convultional neural networks, and support vector machines (for binary responses). In this workflow we will use a random forest model. 
+Here we use the tidymodels family of function for to tune and validate our model. Tidymodels follow a specific model running workflow that allows for quick deployment of models across multiple datasets (or subsets of datasets). A brief description involves defining the appropriate model, defining a number of "steps" to perform on each new dataset, and then running the steps and model (together called a "workflow") to multiple datasets (possibly in parallel). There are several models that can be used such as random forest, xgboost, convolutional neural networks, and support vector machines (for binary responses). In this workflow we will use a random forest model. 
 
 #### Tuning
 
 There are some model parameters (called hyperparameters) that we can adjust independent of our dataset. Depending on the data, adjusting the value of these hyperparameters can lead to improved model prediction performance. For some of these values, we can make informed decisions to pick the most optimal value. For example, random forest models perform reasonably well with 1000 trees, and previous studies have shown few improvements in changing the number of trees. For other values, such as mtry - the number of predictors that will be randomly sampled at each tree split, and min_n - the minimum number of datapoints in a node that are required for the node to be split further, the optimum value may depend on the model data. To choose the best combination of model parameters, we run the model across a range of values and then select which ones give the best performance. We can avoid overfitting the model by tuning our model with our training dataset using a k-fold cross validation scheme before validating the model on our test set.  
-```{r, eval = FALSE}
-modeltype <- "randomforest"
 
+```{r}
 switch(modeltype, 
        "randomforest" = {
          #model
@@ -302,12 +237,11 @@ switch(modeltype,
             min_n(),
             loss_reduction(),
             sample_size = sample_prop(),
-            finalize(mtry(), model_train),
+            finalize(mtry(), soil_train),
             learn_rate(),
             size = xgb_search_levels)
         }
       )
-
 ```
 ### Embedding Step
 
@@ -326,152 +260,108 @@ Tidymodels uses the term "recipe" to define a series of processing "steps" to us
 + **pca** - OTU counts are transformed using pca embeddings learned from the current data.
 
 For word and PCA, current data can refer to independent datasets or folds of the data from a crossvalidation scheme.
-
-###### Define model "recipe" (see above)
-
-```{r, eval = FALSE}
-remove <- paste(substr(taxa_level,1,1), "__", sep = "")
-#model recipe and steps
-base_rec <- recipe(head(model_train)) %>%
-#because we can have a large number of variables in our model formula (>100), we have to separately define our predictor and outcome variables instead of using a formula.
-  update_role(starts_with(remove), new_role = "predictor") %>% #select column that start with the taxa prefix ($__), let those be predictors
-  update_role(response, new_role = "outcome") %>% #response variable is our outcome
-  step_naomit(response) #remove NAs
-
-embedding <- "transformword"
+```{r}
 
 #define embedding space
 switch(embedding, 
-        "base"  = {},
+        "base"  = {rec <- base_rec},
         "abundance" = {rec <- step_abundance(base_rec, all_predictors())},
         "pca" = {rec <- step_cpca(base_rec, all_predictors(), options = list("rank" = rank, names = TRUE))},
         "word" = {rec <- step_word(base_rec, all_predictors(), options = list("rank" = rank, names = TRUE))}, 
         "transformword" = {rec <- step_transform(base_rec, all_predictors(), options = list("transform_embedding" = word_matrix, names = TRUE))},
         "transformpca" = {rec <- step_transform(base_rec, all_predictors(), options = list("transform_embedding" = pca_matrix, names = TRUE))}      
-        )
+       )
+```
 
+### K-Cross validation and Running the Model
+
+We use K-fold cross validation to split our training data into K number of folds. We then run the model K times where in each run, K-1 folds are used as the training data and 1 fold is used as the test set. We do to this measure the variance in our model and avoid bias model predictions from overfitting to a specific set of data. After tuning our model, we can look at the best performing models based on our preferred performance metric. We then use these parameters in our final model fit.
+
+```{r, eval = FALSE}
 #Define the tuning work flow
 tune_workflow <- 
   workflow() %>% #workflow objects
   add_recipe(rec) %>% #add recipe
   add_model(model) #add model
-```
 
-
-### K-Cross validation, Null Models, and Running the Model
-
-We use K-fold cross validation to split our training data into K number of folds. We then run the model K times where in each run, K-1 folds are used as the training data and 1 fold is used as the test set. We do to this measure the variance in our model and avoid bias model predictions from overfitting to a specific set of data. After tuning our model, we can look at the best performing models based on our preferred performance metric. We then use these parameters in our final model fit. Lastly, we want to compare the results of our model predictions to a custom null model which predicts classes based on the proportion of samples in the data. 
-
-```{r,  eval = FALSE}
 #cross validation for training
 #we stratify samples across the sample response to make sure that each fold has an even distribution of classes.
-folds_train <- vfold_cv(model_train, v = nrepeats, strata = response)
+train_folds <- vfold_cv(soil_train, v = nrepeats, strata = response)
 
 #check tune results
-
-#Define a vector of metric parameters to evaluate model accuracy
 options(tidymodels.dark = TRUE)
-multi_metric <- metric_set(accuracy, bal_accuracy, f_meas, kap, npv, ppv, precision, recall, sens, spec, roc_auc, pr_auc)
+#Define a vector of metric parameters to evaluate model accuracy
+multi_metric <- metric_set(accuracy, bal_accuracy, f_meas, kap, npv, ppv, precision, recall, sens, pr_auc, roc_auc)
+message("TUNING MODEL")
 tune_results <- tune_grid(tune_workflow,  #tune a parameter grid using the tune_workflow
-                          resamples = folds_train,  #apply the workflow to folds created by vfold_cv
+                          resamples = train_folds,  #apply the workflow to folds created by vfold_cv
                           grid = search_grid,  #search of provided list of parameters
-                          metrics = multi_metric, #calculate performance using metrics in metric set
+                          #metrics = multi_metric, #calculate performance using metrics in metric set
                           control = control_grid( #control parameters to tuning process
                             verbose = TRUE, #print progress of tuning to console
                             allow_par = TRUE, #allow parallel processing if parallel backend registers
-                            extract = function (x) {extract_model(x)$prediction.error}, #extract model specificiations for each tune iterations
+                            #extract = function (x) {extract_model(x)}, #extract model specificiations for each tune iterations
                             save_pred = TRUE)) #save model predictions 
 
 #what are the best parameters
 best <- show_best(tune_results, metric = "accuracy", n = 5) #pick top n results from tuning based on metric
 best_parameters <- select_best(tune_results, metric = "accuracy")
 
+final_workflow <- tune_workflow %>%
+  finalize_workflow(best_parameters) 
 
+final_model <- parsnip::fit(final_workflow, training(soil_split))
+```
+
+### Fitting final model
+
+From the results of our tuning, we can select the best hyperparameters to make our model. We then fit our chosen model to our training data before validating it on our testing set. We bootstrap our testing set to avoid overfitting and to get a range of results to generate confidence intervals. Bootstrapping is a resampling method that generates subsets of data using random sampling with replacement.Lastly, we want to compare the results of our model predictions to a custom null model which predicts classes based on the proportion of samples in the data. 
+
+```{r, eval = FALSE}
 #create custom model prediction function based off proportion of classes within data (equivalent to guessing)
-custom_nullsample <- function(x){ #take in a splits object which defines the data splits created by vfold_cv
-  train <- analysis(x)$response #take out class categories from training data
-  test <- assessment(x)$response #take out class categories from testing data
+custom_nullsample <- function(x, response = "blank"){ #take in a splits object which defines the data splits created by vfold_cv
+  train <- analysis(x)[[response]] #take out class categories from training data
+  test <- assessment(x)[[response]] #take out class categories from testing data
   preds = sample(size = length(test), x = names(table(train)), prob = as.numeric(table(train)), replace = T) #make n draws, where n is the length of responses in the test set, from the classes in the training set with equal probability to their proportions in the testing set with replacement
   res <- tibble(estimate = preds, response = test) #merge test responses with test predictions
   return(res) #return results
 }
 
 tune_results <- tune_results %>% 
-  mutate(.null = future_map(splits, custom_nullsample)) %>% #create null guess
+  mutate(.null = future_map(splits, custom_nullsample, response = response)) %>% 
+  mutate(.predictions = future_map(.predictions, ~rename_(., response = response))) %>%#create null guess
   select(-c("splits")) #remove splits object which takes a majority of the data within the tune_results objects
 
-```
+soil_bootstraps <- bootstraps(soil_test,times = nrepeats, strata = response) #Create bootstrapped datasets of testing data
 
-### Fitting final model
+test_results <- soil_bootstraps %>%
+  mutate(.probabilities = future_map(splits, ~predict(final_model, new_data =  analysis(.), type = "prob"))) %>% #probability predictions using final model on bootstrapped data splits
+  mutate(.predictions = future_map(splits, ~predict(final_model, analysis(.)))) %>% #class predictions
+  mutate(.predictions = future_map2(splits, .predictions, ~cbind(analysis(.x)[[response]], .y))) %>% #bind predictions with truth
+  mutate(.predictions = future_map(.predictions, ~rename(., response = "analysis(.x)[[response]]"))) %>% #rename table to predictions
+  mutate(.predictions = future_map2(.predictions, .probabilities, cbind)) %>% #bind predictions/truth with probability estimates
+  mutate(.predictions = future_map(.predictions, ~mutate(., response = droplevels(response)))) %>% #remove extra factor levels
+  select(-c(.probabilities)) #remove probabilities
 
-From the results of our tuning, we can select the best hyperparameters to make our model. We then fit our chosen model to our training data before validating it on our testing set. We bootstrap our testing set to avoid overfitting and to get a range of results to generate confidence intervals. Bootstrapping is a resampling method that generates subsets of data using random sampling with replacement.  
+#for null model estimates, pull the truth responses from training set
+train = soil_train[[response]]
 
-```{r, eval = FALSE}
-#make final model using best parameters
-switch(modeltype, 
-       "randomforest" = {
-         #model
-         final_model <- rand_forest(
-          trees = 1000,
-          mtry = best_parameters[["mtry"]],
-          min_n = best_parameters[["min_n"]]) %>% 
-           set_engine("ranger") %>% set_mode("classification")
-         },
-       "xgboost" = {
-         #model 
-         final_model <- boost_tree(
-          trees = 1000, 
-          tree_depth = best_parameters[["tree_depth"]],
-          min_n = best_parameters[["min_n"]], 
-          loss_reduction =  best_parameters[["loss_reduction"]],                     
-          sample_size =  best_parameters[["sample_size"]], 
-          mtry =  best_parameters[["mtry"]],                               
-          learn_rate =  best_parameters[["learn_rate"]] ) %>% 
-           set_engine("xgboost") %>% set_mode("classification"); 
-        }
-      )
-
-#tidymodel syntax requires you "prep" a "recipe" before "bake" (baking) it onto data
-train_data <- prep(rec) %>% bake(model_train)
-
-message(Sys.time()," FITTING MODEL")
-model_fit <- final_model %>% fit(response ~., data = train_data)
-
-#split testing data into multiple folds (replace with bootstrap?)
-bootstraps_test <- bootstraps(model_test, v = nrepeats, strata = response)
-
-#fit final model on test set
-plan(multiprocess)
-fit_results <- bootstraps_test %>%
-  mutate(.analysis = future_map(splits, analysis)) %>% #take analysis (training) portion of bootstraps split
-  mutate(.predictions = future_map(.analysis, function(x){predict(model_fit, x)})) %>% #predict on data using model_fit
-  mutate(.probabilities = future_map(.analysis, function(x){predict(model_fit, x, type = "prob")})) %>% #get prediction probabilities
-  mutate(.response = future_map(.analysis, function(x){x$response})) %>% #get true values
-  select(-c(.analysis)) #remove train data
-```
-##### Null model (but for testing)
-
-We also make predictions using a null model which is simply the probability of getting a correct classification by guessing according to the proportion of classes in the dataset. Ex: if 50% of all biomes are "forest", how well do I perform if i just guess "forest" 50% of the time?
-
-```{r, eval = FALSE}
-custom_nullsample <- function(x){ #custom null sample object
-  train <- analysis(x)$response #take responses from training set
-  test <- assessment(x)$response #take response from test set
-  #make guesses equal to the length of responses from the test set but using classes and probabilities from the training set
-  preds = sample(size = length(test), x = names(table(train)), prob = as.numeric(table(train)), replace = T) 
-  #bind to tibble
+#a second null sample function with the option to provide training proportions
+custom_test_null <- function(x, y, response){
+  test <- analysis(x)[[response]]
+  preds <- sample(size = length(test), x = names(table(y)), prob = as.numeric(table(y)), replace = T)
   res <- tibble(estimate = preds, response = test)
-  return(res)
 }
-#
 
-fit_results <- fit_results %>% 
-  mutate(.null = future_map(splits, custom_nullsample)) %>% #create null model predictions
-  select(-c("splits")) #remove splits
+test_results <- test_results %>% 
+  mutate(.null = future_map(splits, custom_test_null, y = train, response = response)) %>% #create null guess using proportions of truth response from training set
+  select(-c("splits")) 
 
-#save tuning and testing results into single object
-final_results <- list(tune_results, fit_results)
-names(final_results) <- c("tune", "test")
+
+final_results <- list(tune_results, best, test_results, final_model)
+names(final_results) <- c("tune", "best", "test", "model")
 #save final results as object along with model parameters as name.
 saveRDS(final_results, paste(outputFolder,"/", taxa_level,"_", resp,"_", modeltype, "_", rank, "_", embedding, ".RDS", sep = ""))
+
 ```
+

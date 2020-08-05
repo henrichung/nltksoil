@@ -4,4 +4,5 @@
 .Ruserdata
 data/*
 docs/*
+code/old/*
 *.RDS
