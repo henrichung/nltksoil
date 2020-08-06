@@ -16,7 +16,7 @@ invisible(capture.output(lapply(list.of.packages, library, character.only = TRUE
 
 rm(list = ls()) #clear environment
 args <- commandArgs(trailingOnly = TRUE)
-source("code/nltksoil_functions.R") #Load functions
+source("../code/nltksoil_functions.R") #Load functions
 ```
 
 ### Background
